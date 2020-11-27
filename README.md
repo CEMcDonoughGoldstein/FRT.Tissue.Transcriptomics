@@ -8,4 +8,4 @@ Raw data is available from GEO accession GSE143759
 
 Other data neccesary for analyses - gene length, name conversion, chromosome and position, molecular evolution, and ModEncode expression.
 
-This repository includes all data and code necessary to replicate the analyses reproted in the manuscript. The code is found in "FRT.Transcriptomics.Analysis.Submitted.rmd" and the raw data is "FRT.Clean.txt". A summary of all anlayses (Table S1 in the manuscript) is also included as "FRT.SummaryAnalysis.S1.xlsx" For any qestions contact Caitlin at mcdonouce@gmail.com
+This repository includes all data and code necessary to replicate the analyses reproted in the manuscript. The code is found in "FRT.Transcriptomics.Analysis.Submitted.rmd" and the raw data is "FRT.Clean.txt". The normalized data set is included as "FRT.normalized.txt" and the supplemental table 1 outputs with average expression for each sample "Supp1.AvgExpression.txt" and summary of all anlayses "Supp1.summary.txt". For any qestions contact Caitlin at mcdonouce@gmail.com
