@@ -1,0 +1,3209 @@
+---
+title: "FRT Transcriptomics Analysis"
+output: html_notebook
+---
+
+Load neccesary programs
+```{r}
+libraries <- c( "PMCMRplus", "pvclust", "UpSetR", "tidyr", "dplyr", "plyr", "reshape2", "splitstackshape", "tibble", "ggplot2",  "ggdendro", "ggridges", "gridExtra", "grDevices", "gplots", "RColorBrewer", "plotly", "plot3D", "pheatmap", "boot", "devtools", "statmod")
+
+libraries.have <- libraries %in% rownames(installed.packages())
+if(any(!libraries.have)) install.packages(libraries[!libraries.have], quiet = T)
+
+lapply(libraries, require, character.only = TRUE)
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("edgeR")
+BiocManager::install("cummeRbund")
+BiocManager::install("geneplotter")
+BiocManager::install("Mfuzz")
+
+
+install_github("vqv/ggbiplot")
+
+lapply(c("edgeR", "cummeRbund", "geneplotter", "ggbiplot", "Mfuzz"), require, character.only = T)
+
+#https://micahallen.org/2018/03/15/introducing-raincloud-plots/
+source("https://gist.githubusercontent.com/benmarwick/2a1bb0133ff568cbe28d/raw/fb53bd97121f7f9ce947837ef1a4c65a73bffb3f/geom_flat_violin.R")
+```
+
+
+Load needed functions
+```{r}
+#turns the first column into the row names
+rownames.first <- function(object){
+  object <- data.frame(object[,-1], row.names = object[,1])
+}
+
+#separates out things in list from Upset input
+#https://github.com/hms-dbmi/UpSetR/issues/85
+fromList <- function (input) {
+  # Same as original fromList()...
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+      x <- as.vector(match(elements, x))
+      }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names!
+  row.names(data) <- elements
+  return(data)
+}
+
+#calculates standard error
+#https://www.r-bloggers.com/grouped-means-again/
+st.err <- function(x, na.rm=FALSE) {
+     if(na.rm==TRUE) x <- na.omit(x)
+     sd(x)/sqrt(length(x))
+}
+
+#calculate tau measure of tissue specificity
+#https://github.com/severinEvo/gene_expression
+tau<-function(x){
+  if(any(is.na(x))) stop('NA\'s need to be 0.')
+  if(any(x<0)) stop('Negative input values not permitted. Maybe data is log transformed?')
+  t<-sum(1-x/max(x))/(length(x)-1)
+}
+#tau <- apply(dataset, 1, tau)
+
+
+#raincloud theme for postmating DE plots
+#https://micahallen.org/2018/03/15/introducing-raincloud-plots/
+raincloud_theme = theme(
+text = element_text(size = 10),
+axis.title.x = element_text(size = 16),
+axis.title.y = element_text(size = 16),
+axis.text = element_text(size = 14),
+axis.text.x = element_text(vjust = 0.5),
+legend.title=element_text(size=16),
+legend.text=element_text(size=16),
+legend.position = "right",
+plot.title = element_text(lineheight=.8, face="bold", size = 16),
+panel.border = element_blank(),
+panel.grid.minor = element_blank(),
+panel.grid.major = element_blank(),
+axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'))
+
+
+#make tissue potmating comparison figure
+postmating.tissuecomparison <- function (tissue1.log, tissue1.FDR, tiss1.col,
+                                         tissue2.log, tissue2.FDR, tiss2.col,
+                                         x.pos, y.pos, text.x, text.y){
+ggplot(data=Tissue.post.spread, aes(y=tissue1.log, x=tissue2.log))+
+geom_point(alpha=with(Tissue.post.spread, ifelse(tissue1.FDR > 0.01 & tissue2.FDR > 0.01, 0.3, 0.85)), 
+           cex=0.75, pch=19,
+           col=with(Tissue.post.spread, ifelse(tissue1.FDR > 0.01 & tissue2.FDR > 0.01, "grey55", ifelse(tissue1.FDR < 0.01 & tissue2.FDR > 0.01, tiss1.col, ifelse(tissue1.FDR > 0.01 & tissue2.FDR < 0.01, tiss2.col, "red")))))+
+geom_smooth(method=lm, se=T, col="black") +
+scale_x_continuous(position=x.pos, breaks=c(-4, -2, 0, 2, 4), limits=c(-5, 5)) + 
+scale_y_continuous(position=y.pos, breaks=c(-4, -2, 0, 2, 4), limits=c(-5, 5)) + 
+theme_classic()+
+theme(axis.title.x=element_blank(),
+      axis.text.x=text.x,
+      axis.ticks.x = element_blank(),
+      axis.title.y=element_blank(),
+      axis.text.y=text.y,
+      axis.ticks.y=element_blank(),
+      panel.border = element_rect(colour = "black", fill=NA, size=2.5))
+}
+
+#get pvalue from regression
+#http://www.gettinggeneticsdone.com/2011/01/rstats-function-for-extracting-f-test-p.html
+lmp <- function (modelobject) {
+	if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+	f <- summary(modelobject)$fstatistic
+	p <- pf(f[1],f[2],f[3],lower.tail=F)
+	attributes(p) <- NULL
+	return(p)
+}
+
+#mean function for boot strap evo rate data
+meanfun <- function(data, i){
+  d <- data[i]
+  return(mean(d))   
+}
+
+#set up rsq function for bootstrapping regressions
+#https://www.statmethods.net/advstats/bootstrapping.html
+boot.rsq <- function(formula, data, indices) {
+  d <- data[indices,] # allows boot to select sample 
+  fit <- lm(formula, data=d)
+  return(summary(fit)$r.square)
+} 
+
+```
+
+Define tissue colors
+```{r}
+po.col <- rgb(197,163,199, maxColorValue = 255)
+st.col <- rgb(88,37,131, maxColorValue = 255)
+fb.col <- rgb(255,239,245, maxColorValue = 255)
+bur.col <- rgb(0,130,99, maxColorValue = 255)
+sr.col <- rgb(64,142,222, maxColorValue = 255)
+ovd.col <- rgb(106,203,186, maxColorValue = 255)
+```
+
+Load in supplemental data
+See "SupplementalDataPreProcessing.rmd" for full code related to curation of files
+```{r}
+# Samples
+Samples <- read.table("Samples.txt", header=T)
+
+# Length
+length <- read.table("length.txt", header=T)
+
+# Signal Annotation (UniProt)
+signal <- read.table("signal.txt", header=T, stringsAsFactors = FALSE)
+
+# Evolutionary rate
+paml_all <- read.table("paml_all.txt", header = T)
+
+# ModEncode Tissues
+ME.tissuemax <- read.table("ME.tissue.txt", header=T)
+
+# Chromosome
+Assemb <- read.table("Assemb.txt", header=T)
+
+# FBgn & Gene name Conversion
+convert <- read.table("convert.txt", header=T)
+```
+
+Read in raw FRT data
+Library preperation, RNA sequencing and initial processing (removing adapters and exclude low quality) performed by BGI. We used Hisat and string tie (suppressing reads that don't align and or novel splice sites) to generate read counts for each gene.
+```{r}
+FRT <- read.table("FRT.Clean.txt", header = T)
+FRT <- rownames.first(FRT)
+
+replicates <- Samples %>%
+  group_by(Tissue, Time) %>%
+  summarise (Freq = n())
+
+median(replicates$Freq) # Median of 4 replicates per sample
+min(replicates$Freq) # Minimum of 2 replicates per sample
+```
+
+QC: Look at library sizes
+Ideally they should all be > 20 million but two of the SR only have > 10 million
+Because the SR with lower reads don't stand out as abberant in any of the following QC steps we did not remove them.
+```{r}
+libSizes = as.data.frame(colSums(FRT))
+libSizes = cbind(sample = row.names(libSizes), libSizes)
+
+libSizes <- full_join(libSizes, Samples, by=c("sample" = "Sample"))
+
+libSizes$Tissue <- factor(libSizes$Tissue, levels=c("BUR", "OVD", "SR", "ST","PO", "FB", "WF"))
+libSizes$Time <- factor(libSizes$Time, levels=c("V", "6hr", "24h"))
+libSizes$Run <- factor(libSizes$Run, levels = c(1, 2))
+libSizes$sample <- factor(libSizes$sample, levels = c("BUR_U_1_1", "BUR_U_1_2", "BUR_U_2_3","BUR_U_2_4", "BUR_6hr_1_1", "BUR_6hr_1_2", "BUR_6hr_2_3", "BUR_6hr_2_4", "BUR_24hr_1_1", "BUR_24hr_1_2", "BUR_24hr_2_3", "BUR_24hr_2_4","OVD_U_1_1", "OVD_U_2_2", "OVD_U_2_3","OVD_6hr_2_1", "OVD_6hr_2_2","OVD_24hr_1_1", "OVD_24hr_2_2", "OVD_24hr_2_3", "SR_U_1_1","SR_U_2_2", "SR_U_2_3", "SR_6hr_1_1", "SR_6hr_1_2", "SR_6hr_2_3", "SR_6hr_2_4","SR_24hr_1_1", "SR_24hr_2_2", "SR_24hr_2_3", "ST_U_1_1", "ST_U_1_2", "ST_U_2_3", "ST_U_2_4", "ST_6hr_1_1", "ST_6hr_1_2", "ST_6hr_2_3", "ST_6hr_2_4", "ST_24hr_1_1", "ST_24hr_1_2", "ST_24hr_2_3", "ST_24hr_2_4", "PO_U_1_1", "PO_U_1_2", "PO_U_2_3", "PO_U_2_4", "PO_6hr_1_1", "PO_6hr_2_2", "PO_6hr_2_3","PO_24hr_1_1", "PO_24hr_1_2", "PO_24hr_2_3", "PO_24hr_2_4", "FB_U_1_1", "FB_U_1_2", "FB_U_2_3", "FB_U_2_4", "FB_6hr_1_1", "FB_6hr_2_2", "FB_6hr_2_3","FB_24hr_2_1", "FB_24hr_2_2","WF_U_2_1","WF_U_2_2"))
+
+row.names(libSizes)= NULL
+
+#tiff('FigS1-A.tiff', units="in", width=8, height=5, res=300)
+ggplot(libSizes, aes(x=sample, y=colSums(FRT), fill=Tissue)) + 
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=c(bur.col, ovd.col, sr.col, st.col, po.col, fb.col, "grey65")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust= 0.5)) + 
+  labs(x="Sample",y="Library Size") +
+  geom_hline(yintercept = 20000000, lty=2) +
+  geom_hline(yintercept = 10000000, lty=1)
+#dev.off()
+
+mean(libSizes$`colSums(FRT)`) # 24671261 reads
+min(libSizes$`colSums(FRT)`) # 12177864 reads
+sd(libSizes$`colSums(FRT)`) # 2293185
+st.err(libSizes$`colSums(FRT)`) # 286648.2
+```
+
+QC: Remove low expressed genes
+To be kept a gene must have a CPM of more than 2 in all replicates of a sample (tissue/time point)
+Genes are classified as expressed in a tissue if they meet the inclusion criteria at any timepoint.
+
+Then look at the overlaps among tissues in expressed genes.
+```{r}
+#convert data to cpm (edgeR)
+cpmFRT <- cpm(FRT)
+cpmFRT.Tissue <- as.data.frame(cpmFRT)
+
+#Identify genes with cpm > 2 for all replicates at each timpoint of each tissue.
+#Then create a set of tissue expressed genes as those which are identified at any timepoint
+
+cpmFRT.BUR <- cpmFRT.Tissue[grep("BUR", colnames(cpmFRT.Tissue))]
+cpmFRT.BUR6 <- row.names(cpmFRT.BUR[apply(cpmFRT.BUR[grep("6hr", colnames(cpmFRT.BUR))], MARGIN= 1, function(x) all(x > 2)), ]) #6491 genes
+cpmFRT.BUR24 <- row.names(cpmFRT.BUR[apply(cpmFRT.BUR[grep("24hr", colnames(cpmFRT.BUR))], MARGIN= 1, function(x) all(x > 2)), ]) #6746 genes
+cpmFRT.BURU <- row.names(cpmFRT.BUR[apply(cpmFRT.BUR[grep("U", colnames(cpmFRT.BUR))], MARGIN= 1, function(x) all(x > 2)), ]) #6283 genes
+cpmFRT.BUR <- unique(c(cpmFRT.BURU, cpmFRT.BUR6, cpmFRT.BUR24)) #6920 genes
+
+cpmFRT.OVD <- cpmFRT.Tissue[grep("OVD", colnames(cpmFRT.Tissue))]
+cpmFRT.OVD6 <- row.names(cpmFRT.OVD[apply(cpmFRT.OVD[grep("6hr", colnames(cpmFRT.OVD))], MARGIN= 1, function(x) all(x > 2)), ]) #7389 genes
+cpmFRT.OVD24 <- row.names(cpmFRT.OVD[apply(cpmFRT.OVD[grep("24hr", colnames(cpmFRT.OVD))], MARGIN= 1, function(x) all(x > 2)), ]) #7149 genes
+cpmFRT.OVDU <- row.names(cpmFRT.OVD[apply(cpmFRT.OVD[grep("U", colnames(cpmFRT.OVD))], MARGIN= 1, function(x) all(x > 2)), ]) #7452 genes
+cpmFRT.OVD <- unique(c(cpmFRT.OVDU, cpmFRT.OVD6, cpmFRT.OVD24)) #7644 genes
+
+cpmFRT.SR <- cpmFRT.Tissue[grep("SR", colnames(cpmFRT.Tissue))]
+cpmFRT.SR6 <- row.names(cpmFRT.SR[apply(cpmFRT.SR[grep("6hr", colnames(cpmFRT.SR))], MARGIN= 1, function(x) all(x > 2)), ]) #7344 genes
+cpmFRT.SR24 <- row.names(cpmFRT.SR[apply(cpmFRT.SR[grep("24hr", colnames(cpmFRT.SR))], MARGIN= 1, function(x) all(x > 2)), ]) #7431 genes
+cpmFRT.SRU <- row.names(cpmFRT.SR[apply(cpmFRT.SR[grep("U", colnames(cpmFRT.SR))], MARGIN= 1, function(x) all(x > 2)), ]) #7566 genes
+cpmFRT.SR <- unique(c(cpmFRT.SRU, cpmFRT.SR6, cpmFRT.SR24)) #7748 genes
+
+cpmFRT.ST <- cpmFRT.Tissue[grep("ST", colnames(cpmFRT.Tissue))]
+cpmFRT.ST6 <- row.names(cpmFRT.ST[apply(cpmFRT.ST[grep("6hr", colnames(cpmFRT.ST))], MARGIN= 1, function(x) all(x > 2)), ]) #6676 genes
+cpmFRT.ST24 <- row.names(cpmFRT.ST[apply(cpmFRT.ST[grep("24hr", colnames(cpmFRT.ST))], MARGIN= 1, function(x) all(x > 2)), ]) #6693 genes
+cpmFRT.STU <- row.names(cpmFRT.ST[apply(cpmFRT.ST[grep("U", colnames(cpmFRT.ST))], MARGIN= 1, function(x) all(x > 2)), ]) #6736 genes
+cpmFRT.ST <- unique(c(cpmFRT.STU, cpmFRT.ST6, cpmFRT.ST24)) #7000 genes
+
+cpmFRT.PO <- cpmFRT.Tissue[grep("PO", colnames(cpmFRT.Tissue))] 
+cpmFRT.PO6 <- row.names(cpmFRT.PO[apply(cpmFRT.PO[grep("6hr", colnames(cpmFRT.PO))], MARGIN= 1, function(x) all(x > 2)), ]) #6465 genes
+cpmFRT.PO24 <- row.names(cpmFRT.PO[apply(cpmFRT.PO[grep("24hr", colnames(cpmFRT.PO))], MARGIN= 1, function(x) all(x > 2)), ]) #5914 genes
+cpmFRT.POU <- row.names(cpmFRT.PO[apply(cpmFRT.PO[grep("U", colnames(cpmFRT.PO))], MARGIN= 1, function(x) all(x > 2)), ]) #6527 genes
+cpmFRT.PO <- unique(c(cpmFRT.POU, cpmFRT.PO6, cpmFRT.PO24)) #6723 genes
+
+cpmFRT.FB <- cpmFRT.Tissue[grep("FB", colnames(cpmFRT.Tissue))] 
+cpmFRT.FB6 <- row.names(cpmFRT.FB[apply(cpmFRT.FB[grep("6hr", colnames(cpmFRT.FB))], MARGIN= 1, function(x) all(x > 2)), ]) #4414 genes
+cpmFRT.FB24 <- row.names(cpmFRT.FB[apply(cpmFRT.FB[grep("24hr", colnames(cpmFRT.FB))], MARGIN= 1, function(x) all(x > 2)), ]) #4344 genes
+cpmFRT.FBU <- row.names(cpmFRT.FB[apply(cpmFRT.FB[grep("U", colnames(cpmFRT.FB))], MARGIN= 1, function(x) all(x > 2)), ]) #4307 genes
+cpmFRT.FB <- unique(c(cpmFRT.FBU, cpmFRT.FB6, cpmFRT.FB24)) #4787 genes
+
+cpmFRT.WF <- cpmFRT.Tissue[grep("WF", colnames(cpmFRT.Tissue))]
+cpmFRT.WF <- row.names(cpmFRT.WF[apply(cpmFRT.WF, MARGIN= 1, function(x) all(x > 2)), ]) 
+length(cpmFRT.WF) #7976 genes
+
+#Average number of genes in FRT tissues tissue
+mean(c(length(cpmFRT.BUR),length(cpmFRT.OVD),length(cpmFRT.SR),length(cpmFRT.ST),length(cpmFRT.PO))) #7207 genes
+
+#Look at overlap among tissues & the WF
+listInput <- list(BUR = cpmFRT.BUR, OVD = cpmFRT.OVD, SR = cpmFRT.SR, ST = cpmFRT.ST, PO = cpmFRT.PO, FB = cpmFRT.FB, WF = cpmFRT.WF )
+upset(fromList(listInput), keep.order=T, order.by = "freq", nsets=7, nintersects = NA, sets.bar.color= c("grey65", sr.col, ovd.col, st.col, bur.col,  po.col, fb.col))
+upset(fromList(listInput), keep.order=T, order.by = "freq", nsets=7, nintersects = 25, sets.bar.color= c("grey65", sr.col, ovd.col, st.col, bur.col,  po.col, fb.col))
+cpm.overlap <- fromList(listInput)
+FB.only <- subset(cpm.overlap, rowSums(cpm.overlap) ==1 & cpm.overlap$FB ==1)
+FB.only$Fbgn <- row.names(FB.only)
+#The greatest number of genes by far are found in all tissues, then all but the FB
+#The WF also has a large set that are unique to it
+
+# Determine the set of genes that are expressed in the FRT as those identified in any FRT tissue or the FB
+cpmFRT.join <- unique(c(cpmFRT.FB, cpmFRT.BUR, cpmFRT.OVD, cpmFRT.SR, cpmFRT.ST, cpmFRT.PO)) #8337 genes
+
+#write list of all these genes to serve as background for gene enrichment analysis
+write.table(cpmFRT.join, "FRT.bkgrd.txt", quote=F, row.names=F, col.names=F)
+```
+
+QC: Compare unmated to postmating to see if we are detecting any exclusively male RNAs being transferred
+Seems to be unlikely here
+```{r}
+#look at the overlap between times
+cpmFRT.Un <- unique(c(cpmFRT.BURU, cpmFRT.OVDU, cpmFRT.SRU, cpmFRT.STU, cpmFRT.POU, cpmFRT.FBU))
+
+cpmFRT.6 <- unique(c(cpmFRT.BUR6, cpmFRT.OVD6, cpmFRT.SR6, cpmFRT.ST6, cpmFRT.PO6, cpmFRT.FB6))
+
+cpmFRT.24 <- unique(c(cpmFRT.BUR24, cpmFRT.OVD24, cpmFRT.SR24, cpmFRT.ST24, cpmFRT.PO24, cpmFRT.FB24))
+
+listInput <- list(Un = cpmFRT.Un, PM6 = cpmFRT.6, PM24 = cpmFRT.24)
+upset(fromList(listInput), keep.order=T, order.by="freq", nsets=3, nintersects=NA)
+
+PMonly <- fromList(listInput)
+PMonly <- subset(PMonly, PMonly$Un == 0 & (PMonly$PM6 ==1 | PMonly$PM24 ==1)) #208 genes that are only found postmating - about 80 at just 6, 80 at just 24, and 45 in both
+PMonly$FBgn <- row.names(PMonly)
+
+(length(cpmFRT.join) - length(PMonly))/ length(cpmFRT.join) # 99.95%
+
+
+listInput <- list( BUR6 = subset(cpmFRT.BUR6, cpmFRT.BUR6 %in% PMonly$FBgn), OVD6 = subset(cpmFRT.OVD6, cpmFRT.OVD6 %in% PMonly$FBgn), SR6 = subset(cpmFRT.SR6, cpmFRT.SR6 %in% PMonly$FBgn), ST6 = subset(cpmFRT.ST6, cpmFRT.ST6 %in% PMonly$FBgn), PO6 = subset(cpmFRT.PO6, cpmFRT.PO6 %in% PMonly$FBgn), FB6 = subset(cpmFRT.FB6, cpmFRT.FB6 %in% PMonly$FBgn), BUR24 = subset(cpmFRT.BUR24, cpmFRT.BUR24 %in% PMonly$FBgn), OVD24 = subset(cpmFRT.OVD24, cpmFRT.OVD24 %in% PMonly$FBgn), SR24 = subset(cpmFRT.SR24, cpmFRT.SR24 %in% PMonly$FBgn), ST24 = subset(cpmFRT.ST24, cpmFRT.ST24 %in% PMonly$FBgn), PO24 = subset(cpmFRT.PO24, cpmFRT.PO24 %in% PMonly$FBgn), FB24 = subset(cpmFRT.FB24, cpmFRT.FB24 %in% PMonly$FBgn))
+upset(fromList(listInput),keep.order=T, order.by="freq", nsets=12, nintersects=NA)
+
+PMonly.tissue <- fromList(listInput)
+PMonly.tissue$sum <- rowSums(PMonly.tissue)
+length(which(PMonly.tissue$sum == 1)) / length(PMonly.tissue$sum) #144, 69.2% are in only one tissue
+
+```
+
+
+QC: Combine gene length and sample info to create DGElist from rawcounts
+Normalize data (edgeR)
+```{r}
+FRT <- DGEList(counts=FRT, genes=data.frame(Length=length$length))
+FRT$samples$tissue <- Samples$Tissue
+FRT$samples$time <- Samples$Time
+FRT$samples$run <- Samples$Run
+FRT$samples$group <- Samples$Tissue
+
+# Remove genes not expressed in teh FRT
+keep.exprs <- row.names(FRT) %in% cpmFRT.join
+FRT.keep <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+
+# TMM normalize data
+FRT.keep.norm <- calcNormFactors(FRT.keep, method = "TMM")
+
+# Normalized expression of genes in the FRT
+# Note do not change this file!!
+cpmFRT <- cpm(FRT.keep.norm)
+write.table(cpmFRT, "FRT.normalized.txt")
+```
+
+QC: Look at density curves of gene expression before and after filtering
+```{r}
+# convert to log cpm use prior.count = 5 because of reccomendation on ###
+lcpmFRT.raw <- cpm(FRT, log=T, prior.count=5)
+lcpmFRT <- cpm(FRT.keep, log=T, prior.count = 5)
+
+#tiff('FigS1-B.tiff', units="in", width=5, height=5, res=300)
+multidensity(lcpmFRT.raw,
+    xlab="log-CPM", col=c(rep(bur.col, 12), rep("pink", 9), rep(ovd.col, 8), rep(po.col, 11), rep(sr.col, 10), rep(st.col, 12), rep("grey64", 2)), main="Raw", legend=NA)
+#dev.off()
+
+#tiff('FigS1-C.tiff', units="in", width=5, height=5, res=300)
+multidensity(lcpmFRT,
+    xlab="log-CPM", col=c(rep(bur.col, 12), rep("pink", 9), rep(ovd.col, 8), rep(po.col, 11), rep(sr.col, 10), rep(st.col, 12), rep("grey64", 2)), main="Filtered", legend=NA)
+#dev.off()
+
+```
+
+QC: look at distribution of normalized data
+```{r}
+# convert to log cpm (doing this again to account for batch effects which is useful in visualizing correlations, MDS) and remove batch effect
+lcpmFRT.B <- cpm(FRT.keep.norm, log=T, prior.count=5)
+lcpmFRT.B <- removeBatchEffect(lcpmFRT.B, batch=Samples$Run)
+
+lcpmFRT.B.melt<-melt(lcpmFRT.B, id=colnames(lcpmFRT.B))
+lcpmFRT.B.melt$Var2 <- factor(lcpmFRT.B.melt$Var2, levels = c("BUR_U_1_1", "BUR_U_1_2", "BUR_U_2_3","BUR_U_2_4", "BUR_6hr_1_1", "BUR_6hr_1_2", "BUR_6hr_2_3", "BUR_6hr_2_4", "BUR_24hr_1_1", "BUR_24hr_1_2", "BUR_24hr_2_3", "BUR_24hr_2_4","OVD_U_1_1", "OVD_U_2_2", "OVD_U_2_3","OVD_6hr_2_1", "OVD_6hr_2_2","OVD_24hr_1_1", "OVD_24hr_2_2", "OVD_24hr_2_3", "SR_U_1_1","SR_U_2_2", "SR_U_2_3", "SR_6hr_1_1", "SR_6hr_1_2", "SR_6hr_2_3", "SR_6hr_2_4","SR_24hr_1_1", "SR_24hr_2_2", "SR_24hr_2_3", "ST_U_1_1", "ST_U_1_2", "ST_U_2_3", "ST_U_2_4", "ST_6hr_1_1", "ST_6hr_1_2", "ST_6hr_2_3", "ST_6hr_2_4", "ST_24hr_1_1", "ST_24hr_1_2", "ST_24hr_2_3", "ST_24hr_2_4", "PO_U_1_1", "PO_U_1_2", "PO_U_2_3", "PO_U_2_4", "PO_6hr_1_1", "PO_6hr_2_2", "PO_6hr_2_3","PO_24hr_1_1", "PO_24hr_1_2", "PO_24hr_2_3", "PO_24hr_2_4", "FB_U_1_1", "FB_U_1_2", "FB_U_2_3", "FB_U_2_4", "FB_6hr_1_1", "FB_6hr_2_2", "FB_6hr_2_3","FB_24hr_2_1", "FB_24hr_2_2","WF_U_2_1","WF_U_2_2"))
+
+#tiff('FigS1-D.tiff', units="in", width=8, height=5, res=300)
+ggplot(lcpmFRT.B.melt, aes(x=Var2, y= value, fill=Var2))+
+  geom_boxplot() +
+  scale_fill_manual(values=c(rep(bur.col, 12), rep(ovd.col, 8), rep(sr.col, 10), rep(st.col, 12), rep(po.col, 11), rep(fb.col, 9), rep("grey65", 2)), guide=F) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust= 0.5)) +
+  labs(x="Sample",y="Normalized Log CPM")
+#dev.off()
+```
+
+QC: Look at MDS distrribution of samples
+```{r}
+#dimensions 1 and 2
+#tiff('FigS1-F.tiff', units="in", width=5, height=5, res=300)
+plotMDS(lcpmFRT.B, dim=c(1,2), bg=c(bur.col, "pink", ovd.col, po.col, sr.col, st.col, "grey65")[Samples$Tissue], pch = c(23,24,21)[Samples$Time], col=c("black", "red")[Samples$Run], cex=1 )
+legend("bottomright", col=c(bur.col, ovd.col, sr.col, st.col, po.col, "pink", "grey65", rep("black",4), "red"), pch=c(rep(16,7),21,24,23,1,1), legend=c("BUR", "OVD","SR","ST","PO","FB","WF","Unmated","6hr","24hr", "Batch1","Batch2" ), ncol=2, cex = 0.5)
+#dev.off()
+
+#dimensions 3 and 4
+#tiff('FigS1-G.tiff', units="in", width=5, height=5, res=300)
+plotMDS(lcpmFRT.B, dim=c(3,4), bg=c(bur.col, "pink", ovd.col, po.col, sr.col, st.col, "grey65")[Samples$Tissue], pch = c(23,24,21)[Samples$Time], col=c("black", "red")[Samples$Run], cex=1 )
+#dev.off()
+```
+
+
+QC: Look at correlations among samples
+```{r}
+# Determine correlations among samples and clustering of samples
+data = as.matrix(lcpmFRT.B)
+sample_cor = cor(data, method='pearson', use='pairwise.complete.obs')
+sample_dist = as.dist(1-sample_cor)
+hc_samples = hclust(sample_dist, method='complete')
+
+#tiff('FigS1-E.tiff', units="in", width=7, height=7, res=300)
+heatmap.2(sample_cor, dendrogram='both', Rowv=as.dendrogram(hc_samples), Colv=as.dendrogram(hc_samples), scale='none', symm=TRUE, density.info='none', col = brewer.pal(9,"Greys"), trace='none', cexCol=0.5, cexRow=0.5, key=T, key.xlab = "Correlation Coeficient", key.ylab = "", key.title="Correlation Coeficient", RowSideColors=c(rep(bur.col, 12), rep(fb.col, 9), rep(ovd.col, 8), rep(po.col, 11), rep(sr.col, 10), rep(st.col, 12), rep("grey65", 2)), ColSideColors=c(rep(bur.col, 12), rep(fb.col, 9), rep(ovd.col, 8), rep(po.col, 11), rep(sr.col, 10), rep(st.col, 12), rep("grey65", 2))) 
+#dev.off()
+
+#calculate correlations between replicates
+cor_mean <- c(sample_cor[1,c(2:4)], sample_cor[2,c(3,4)], sample_cor[3,c(4)]) #BUR 24
+cor_mean <- c(cor_mean, sample_cor[5,c(6:8)], sample_cor[6,c(7,8)], sample_cor[7,c(8)]) # BUR 6
+cor_mean <- c(cor_mean, sample_cor[9,c(10:12)], sample_cor[10,c(11,12)], sample_cor[11,c(12)]) # BUR U
+cor_mean <- c(cor_mean, sample_cor[13,c(14)], sample_cor[15,c(16,17)], sample_cor[16,c(17)]) # FB 24, FB 6
+cor_mean <- c(cor_mean, sample_cor[18,c(19:21)], sample_cor[19,c(20,21)], sample_cor[20,c(21)]) # FB U
+cor_mean <- c(cor_mean, sample_cor[22,c(23:24)], sample_cor[23,c(24)], sample_cor[25,c(26)], 
+                        sample_cor[27,c(28,29)], sample_cor[28,c(29)]) # OVD 24, OVD 6, OVD U
+cor_mean <- c(cor_mean, sample_cor[30,c(31:33)], sample_cor[31,c(32,33)], sample_cor[32,c(33)]) # PO 24
+cor_mean <- c(cor_mean, sample_cor[34,c(35,36)], sample_cor[35,c(36)]) # PO 6
+cor_mean <- c(cor_mean, sample_cor[37,c(38:40)], sample_cor[38,c(39,40)], sample_cor[39,c(40)]) # PO U
+cor_mean <- c(cor_mean, sample_cor[41,c(42:43)], sample_cor[42,c(43)], sample_cor[44,c(45:47)], sample_cor[45,c(46,47)], sample_cor[46,c(47)],
+                        sample_cor[48,c(49,50)], sample_cor[49,c(50)]) # SR 24, SR 6, SR U 
+cor_mean <- c(cor_mean, sample_cor[51,c(52:54)], sample_cor[52,c(53,54)], sample_cor[53,c(54)]) # ST 24
+cor_mean <- c(cor_mean, sample_cor[55,c(56:58)], sample_cor[56,c(57,58)], sample_cor[57,c(58)]) # ST 6
+cor_mean <- c(cor_mean, sample_cor[59,c(60:62)], sample_cor[60,c(61,62)], sample_cor[61,c(62)]) # ST U
+cor_mean <- c(cor_mean, sample_cor[63,c(64)]) # WF
+
+#calculate overall mean and standard error for correlations between replicates
+mean(cor_mean) # 0.961
+min(cor_mean) # 0.893
+st.err(cor_mean) # 0.00197
+```
+
+
+Calculate Average expression across samples
+Create files Average expression for all samples and separated by time each time
+Based on normalized CPM values. 
+Also for Avg log transformmed (done log2 transformation on CPM values +1) was easier for downstream analysis/ visualizations than using the edgeR log transformation and averaging accounts for batch so that's not needed here either).
+```{r}
+#Calculate average expression for each time/tissue
+Avg.CPM <- as.data.frame(cpmFRT)
+Avg.CPM$BUR24 <- rowMeans(Avg.CPM[,c(1:4)])
+Avg.CPM$BUR6 <- rowMeans(Avg.CPM[,c(5:8)])
+Avg.CPM$BURU <- rowMeans(Avg.CPM[,c(9:12)])
+Avg.CPM$FB24 <- rowMeans(Avg.CPM[,c(13:14)])
+Avg.CPM$FB6 <- rowMeans(Avg.CPM[,c(15:17)])
+Avg.CPM$FBU <- rowMeans(Avg.CPM[,c(18:21)])
+Avg.CPM$OVD24 <- rowMeans(Avg.CPM[,c(22:24)])
+Avg.CPM$OVD6 <- rowMeans(Avg.CPM[,c(25:26)])
+Avg.CPM$OVDU <- rowMeans(Avg.CPM[,c(27:29)])
+Avg.CPM$PO24 <- rowMeans(Avg.CPM[,c(30:33)])
+Avg.CPM$PO6 <- rowMeans(Avg.CPM[,c(34:36)])
+Avg.CPM$POU <- rowMeans(Avg.CPM[,c(37:40)])
+Avg.CPM$SR24 <- rowMeans(Avg.CPM[,c(41:43)])
+Avg.CPM$SR6 <- rowMeans(Avg.CPM[,c(44:47)])
+Avg.CPM$SRU <- rowMeans(Avg.CPM[,c(48:50)])
+Avg.CPM$ST24 <- rowMeans(Avg.CPM[,c(51:54)])
+Avg.CPM$ST6 <- rowMeans(Avg.CPM[,c(55:58)])
+Avg.CPM$STU <- rowMeans(Avg.CPM[,c(59:62)])
+Avg.CPM$WF <- rowMeans(Avg.CPM[,c(63,64)])
+
+Avg.CPM <- Avg.CPM[,c(65:83)]
+Avg.CPM.names <- Avg.CPM
+Avg.CPM.names$names <- row.names(Avg.CPM)
+
+#Make files of average expression at each time point
+Avg.CPM.U <- Avg.CPM[,c(3,6,9,12,15,18,19)]
+Avg.CPM.6 <- Avg.CPM[,c(2,5,8,11,14,17,19)]
+Avg.CPM.24 <- Avg.CPM[,c(1,4,7,10,13,16,19)]
+
+#Chose to do this with log (instead of in EdgeR)
+Avg.log <- log((Avg.CPM + 1), 2)
+write.table(Avg.log, "Supp1.AvgExpression.txt", col.names = T, row.names = T)
+
+Avg.log.names <- Avg.log
+Avg.log.names$names <- row.names(Avg.log)
+Avg.log.U <- Avg.log[,c(3,6,9,12,15,18,19)]
+```
+
+Heirarchical clustering with PV clust to get unbiased bootstrap estimates of branches.
+```{r}
+# this takes forever to run
+pv_boot.corr = pvclust (Avg.log, nboot = 10000, method.hclust="average", method.dist="correlation")
+#tiff('pvclust.average.corr.tiff', units="in", width=5, height=6, res=300)
+plot (pv_boot.corr)
+#dev.off()
+
+seplot(pv_boot.corr)
+
+# Make a prettier visualization of the clustering
+dd <- as.dist(1 - cor(Avg.log))
+hc1 <- hclust(dd, method = "average" )
+#tiff('Fig1B.SampleHeirachicalClustering.tiff', units="in", width=6, height=8, res=300)
+plot(as.dendrogram(hc1), cex = 0.5, horiz=T)
+#dev.off()
+```
+
+To get better understanding of differences among tissues using a PCA
+Visualize PCA of all unmated samples (using the normalized & batch corrected log2 CPM from edge R)
+```{r}
+#isolate out just unmated samples
+names.U <- grep("_U_", colnames(lcpmFRT.B), value=TRUE)
+lcpmFRT.B.U <- subset(lcpmFRT.B, select=names.U)
+
+#run PCA
+pca <- prcomp(t(lcpmFRT.B.U[,-c(5:8, 23,24)]))
+std_dev <- pca$sdev
+pr_var <- std_dev^2
+# proportion of variation explained
+prop_varex <- data.frame(pr_var/sum(pr_var))
+
+
+# Percent variation explained by first 4 PCs
+sum(prop_varex[c(1:4),1])#86.3
+sum(prop_varex[c(1:3),1])#77.08
+
+
+# visualize 3D PCA
+pca <- pca$x
+pca <- as.data.frame(pca)
+pca$groups <- c(rep("BUR", 4),  rep("OVD", 3), rep("PO", 4), rep("SR", 3), rep("ST", 4))
+pca$groups2 <- c(rep(1, 4), rep(2, 3), rep(3, 4), rep(4, 3), rep(5, 4))
+
+#tiff('Fig2A.3D-PCA.tiff', units="in", width=8, height=8, res=300)
+scatter3D(pca$PC1, pca$PC3, pca$PC2,phi = 0, bty="b2",
+          xlab = "PC1 (50.14%)", zlab ="PC2 (14.69%)", ylab = "PC3 (12.25%)", pch=21, cex= 1.75,
+          ticktype = "detailed", col="gray25", bg = c(rep(bur.col, 4), rep(ovd.col, 3), rep(po.col, 4), rep(sr.col, 3), rep(st.col, 4)))
+#dev.off()
+```
+
+Correlations between gene expression and PC loading
+```{r}
+PC.corr <- Avg.log.U
+PC.corr$Gene <- row.names(PC.corr)
+colnames(PC.corr) <- c( "BUR", "FB", "OVD","PO", "SR", "ST", "WF", "Gene")
+
+pca <- prcomp(t(lcpmFRT.B.U[,-c(5:8, 23,24)]))
+pca <- pca$rotation
+pca <- pca[,c(1:4)]
+PC.corr <- merge(pca, PC.corr, all.x=T, by.x="row.names", by.y="Gene")
+PC.corr <- rownames.first(PC.corr)
+
+PC.corr$vPC1.GlandvEp <- rowMeans(PC.corr[,c("ST", "PO")]) - rowMeans(PC.corr[,c("BUR", "OVD", "SR")])
+PC.corr$vPC2.POvST <- PC.corr$PO - PC.corr$ST
+PC.corr$vPC3.BUROVDvSR <- rowMeans(PC.corr[,c("BUR", "OVD")]) - PC.corr$SR
+PC.corr$vPC4.BURSRvOVD <- rowMeans(PC.corr[,c("BUR", "SR")]) - PC.corr$OVD
+
+#tiff('Fig2B.PC1.tiff', units="in", width=5, height=5, res=300)
+ggplot(PC.corr, aes(x= PC1, y=vPC1.GlandvEp))+
+  geom_point(alpha= 0.75, cex= 0.75, pch=19, col="grey65")+
+  geom_smooth(method=lm, se=T, col="red") +
+  xlab("PC1 Loading (50.14% of variation)") + 
+  ylab("Log 2 Difference Gland v. Epithelial Expression")+
+  scale_y_continuous(breaks=c( -6, -4, -2, 0, 2, 4, 6), limits = c(-6.5,6.5)) +
+  scale_x_continuous(breaks=c( -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06), limits=c(-0.065, 0.065))+
+  theme_classic()
+#dev.off()
+
+#tiff('Fig2C.PC2.tiff', units="in", width=5, height=5, res=300)
+ggplot(PC.corr, aes(x= PC2, y=vPC2.POvST))+
+  geom_point(alpha= 0.75, cex= 0.75, pch=19, col="grey65")+
+  geom_smooth(method=lm, se=T, col="red") +
+  xlab("PC2 Loading (14.69% of variation)") + 
+  ylab("Log 2 Difference PO v. ST Expression")+
+  scale_y_continuous(breaks=c(  -6, -4, -2, 0, 2, 4, 6, 8, 10), limits = c(-6.5,11)) +
+  scale_x_continuous(breaks=c( -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06, 0.08, 0.1), limits=c(-0.065, 0.11))+
+  theme_classic()
+#dev.off()
+
+#tiff('Fig3C.PC3.tiff', units="in", width=5, height=5, res=300)
+ggplot(PC.corr, aes(x= PC3, y=vPC3.BUROVDvSR))+
+  geom_point(alpha= 0.75, cex= 0.75, pch=19, col="grey65")+
+  geom_smooth(method=lm, se=T, col="red") +
+  xlab("PC3 Loading (12.25% of variation)") + 
+  ylab("Log 2 Difference BUR & OVD v. SR Expression")+
+  scale_y_continuous(breaks=c( -12, -10, -8, -6, -4, -2, 0, 2, 4, 6), limits = c(-13,6.5)) +
+  scale_x_continuous(breaks=c( -0.12, -0.10, -0.08, -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06), limits=c(-0.13, 0.065))+
+  theme_classic()
+#dev.off()
+
+#tiff('Fig4C.PC4.tiff', units="in", width=5, height=5, res=300)
+ggplot(PC.corr, aes(x= PC4, y=vPC4.BURSRvOVD))+
+  geom_point(alpha= 0.75, cex= 0.75, pch=19, col="grey65")+
+  geom_smooth(method=lm, se=T, col="red") +
+  xlab("PC4 Loading (9.22% of variation)") + 
+  ylab("Log 2 Difference BUR & SR v. OVD Expression")+
+  scale_y_continuous(breaks=c( -10, -8, -6, -4, -2, 0, 2, 4, 6), limits = c(-9.5,8)) +
+  scale_x_continuous(breaks=c( -0.10, -0.08, -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06), limits=c(-0.095, 0.08))+
+  theme_classic()
+#dev.off()
+
+round(summary(lm(PC.corr$vPC1.GlandvEp ~ PC.corr$PC1))$r.squared, 2) # 0.95
+lmp(lm(PC.corr$vPC1.GlandvEp ~ PC.corr$PC1)) # p < 0.001
+
+round(summary(lm(PC.corr$vPC2.POvST ~ PC.corr$PC2))$r.squared, 2) # 0.88
+lmp(lm(PC.corr$vPC2.POvST ~ PC.corr$PC2)) # p < 0.001
+
+round(summary(lm(PC.corr$vPC3.BUROVDvSR ~ PC.corr$PC3))$r.squared, 2) # 0.85
+lmp(lm(PC.corr$vPC3.BUROVDvSR ~ PC.corr$PC3)) # p < 0.001
+
+round(summary(lm(PC.corr$vPC4.BURSRvOVD ~ PC.corr$PC4))$r.squared, 2) # 0.69
+lmp(lm(PC.corr$vPC4.BURSRvOVD ~ PC.corr$PC4)) # p < 0.001
+
+```
+
+Differential expression analysis (with EdgeR) of each tissue (unmated) to the whole female
+To focus on the differences between each tissue and the WF, I did the anlaysis on each tissue separetly including  only samples of the tissue of interst and the whole female. I also subsetted data for each to include only the genes expressed in the tissue of interest, re-normalized the data and then ran the analysis. 
+
+Genes with FDR < 0.001 and Log2FC > 2 are called Tissue-enriched (Tissue.WF dataframes)
+Also looked at genes with higher expression and no FC cutoff (Tissue.all dataframes)
+```{r}
+#BUR: 6920 genes
+
+# create new expression set of just genes expressed including only unmated tissue samples and the WF
+keep.exprs <- row.names(FRT) %in% cpmFRT.BUR
+FRT.keep.BUR <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.BUR <- FRT.keep.BUR[,grep('U', FRT.keep.BUR$samples$time)]
+FRT.keep.BUR <- FRT.keep.BUR[,grep('BUR|WF', FRT.keep.BUR$samples$tissue)]
+
+# Normalize based just on included data
+FRT.keep.norm.BUR <- calcNormFactors(FRT.keep.BUR, method="TMM")
+
+# set up experimental design, including run as to account for batch effect and the main effect group which compares unmated tissue to WF
+design <- model.matrix(~0 + FRT.keep.norm.BUR$samples$run + FRT.keep.norm.BUR$samples$group)
+row.names(design) <- colnames(FRT.keep.norm.BUR)
+colnames(design) = c("run", "BUR", "WF")
+BUR.contrasts = makeContrasts(BUR.U.WF=BUR-WF, levels=design)
+
+# estimate dispersion and visualize
+FRT.keep.norm.BUR <- estimateDisp(FRT.keep.norm.BUR, design, robust=T)
+FRT.keep.norm.BUR$common.dispersion
+plotBCV(FRT.keep.norm.BUR)
+
+# run statistics
+BUR.WF <- glmFit(FRT.keep.norm.BUR, design, robust = T)
+BUR.WF <- glmLRT(BUR.WF, contrast = BUR.contrasts) 
+
+# extract pvalue and log FC from output
+BUR.WF <- topTags(BUR.WF, n=NULL)
+BUR.WF <- BUR.WF$table
+
+# save a list of genes that are either tissue enriched or those that have generally higher tissue expression
+BUR.WF.list <- row.names(subset(BUR.WF, logFC > 2 & FDR<0.001)) #1391 genes
+BUR.WF.all <- row.names(subset(BUR.WF, logFC > 0 & FDR<0.001)) #1897 genes
+######################################################################################################
+
+#OVD:7644 genes expressed
+
+keep.exprs <- row.names(FRT) %in% cpmFRT.OVD
+FRT.keep.OVD <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.OVD <- FRT.keep.OVD[,grep('U', FRT.keep.OVD$samples$time)]
+FRT.keep.OVD <- FRT.keep.OVD[,grep('OVD|WF', FRT.keep.OVD$samples$tissue)]
+FRT.keep.norm.OVD <- calcNormFactors(FRT.keep.OVD, method="TMM")
+
+design <- model.matrix(~0 + FRT.keep.norm.OVD$samples$run + FRT.keep.norm.OVD$samples$group)
+row.names(design) <- colnames(FRT.keep.norm.OVD)
+colnames(design) = c("run", "OVD", "WF")
+OVD.contrasts = makeContrasts(OVD.U.WF=OVD-WF, levels=design)
+
+FRT.keep.norm.OVD <- estimateDisp(FRT.keep.norm.OVD, design, robust=T)
+FRT.keep.norm.OVD$common.dispersion
+plotBCV(FRT.keep.norm.OVD)
+OVD.WF <- glmFit(FRT.keep.norm.OVD, design, robust = T)
+OVD.WF <- glmLRT(OVD.WF, contrast = OVD.contrasts) 
+OVD.WF <- topTags(OVD.WF, n=NULL)
+OVD.WF <- OVD.WF$table
+OVD.WF.list <- row.names(subset(OVD.WF, logFC > 2 & FDR<0.001)) #1417 genes
+OVD.WF.all <- row.names(subset(OVD.WF, logFC > 0 & FDR<0.001)) #1785 genes
+######################################################################################################
+
+#SR:7748 genes expressed
+
+keep.exprs <- row.names(FRT) %in% cpmFRT.SR
+FRT.keep.SR <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.SR <- FRT.keep.SR[,grep('U', FRT.keep.SR$samples$time)]
+FRT.keep.SR <- FRT.keep.SR[,grep('SR|WF', FRT.keep.SR$samples$tissue)]
+FRT.keep.norm.SR <- calcNormFactors(FRT.keep.SR, method="TMM")
+
+design <- model.matrix(~0 + FRT.keep.norm.SR$samples$run + FRT.keep.norm.SR$samples$group)
+row.names(design) <- colnames(FRT.keep.norm.SR)
+colnames(design) = c("run", "SR", "WF")
+SR.contrasts = makeContrasts(SR.U.WF=SR-WF, levels=design)
+
+FRT.keep.norm.SR <- estimateDisp(FRT.keep.norm.SR, design, robust=T)
+FRT.keep.norm.SR$common.dispersion
+plotBCV(FRT.keep.norm.SR)
+SR.WF <- glmFit(FRT.keep.norm.SR, design, robust = T)
+SR.WF <- glmLRT(SR.WF, contrast = SR.contrasts) 
+SR.WF <- topTags(SR.WF, n=NULL)
+SR.WF <- SR.WF$table
+SR.WF.list <- row.names(subset(SR.WF, logFC > 2 & FDR<0.001)) #1578 genes
+SR.WF.all <- row.names(subset(SR.WF, logFC > 0 & FDR<0.001)) #1822 genes
+######################################################################################################
+
+#ST:7000 genes expressed
+
+keep.exprs <- row.names(FRT) %in% cpmFRT.ST
+FRT.keep.ST <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.ST <- FRT.keep.ST[,grep('U', FRT.keep.ST$samples$time)]
+FRT.keep.ST <- FRT.keep.ST[,grep('ST|WF', FRT.keep.ST$samples$tissue)]
+FRT.keep.norm.ST <- calcNormFactors(FRT.keep.ST, method="TMM")
+
+design <- model.matrix(~0 + FRT.keep.norm.ST$samples$run + FRT.keep.norm.ST$samples$group)
+row.names(design) <- colnames(FRT.keep.norm.ST)
+colnames(design) = c("run", "ST", "WF")
+ST.contrasts = makeContrasts(ST.U.WF=ST-WF, levels=design)
+
+FRT.keep.norm.ST <- estimateDisp(FRT.keep.norm.ST, design, robust=T)
+FRT.keep.norm.ST$common.dispersion
+plotBCV(FRT.keep.norm.ST)
+ST.WF <- glmFit(FRT.keep.norm.ST, design, robust = T)
+ST.WF <- glmLRT(ST.WF, contrast=ST.contrasts) 
+ST.WF <- topTags(ST.WF, n=NULL)
+ST.WF <- ST.WF$table
+ST.WF.list <- row.names(subset(ST.WF, logFC > 2 & FDR<0.001)) #1055 genes
+ST.WF.all <- row.names(subset(ST.WF, logFC > 0 & FDR<0.001)) #1687 genes
+######################################################################################################
+
+#PO:6723 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.PO
+FRT.keep.PO <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.PO <- FRT.keep.PO[,grep('U', FRT.keep.PO$samples$time)]
+FRT.keep.PO <- FRT.keep.PO[,grep('PO|WF', FRT.keep.PO$samples$tissue)]
+FRT.keep.norm.PO <- calcNormFactors(FRT.keep.PO, method="TMM")
+
+design <- model.matrix(~0 + FRT.keep.norm.PO$samples$run + FRT.keep.norm.PO$samples$group)
+row.names(design) <- colnames(FRT.keep.norm.PO)
+colnames(design) = c("run", "PO", "WF")
+PO.contrasts = makeContrasts(PO.U.WF=PO-WF, levels=design)
+
+FRT.keep.norm.PO <- estimateDisp(FRT.keep.norm.PO, design, robust=T)
+FRT.keep.norm.PO$common.dispersion
+plotBCV(FRT.keep.norm.PO)
+PO.WF <- glmFit(FRT.keep.norm.PO, design, robust = T)
+PO.WF <- glmLRT(PO.WF, contrast = PO.contrasts) 
+PO.WF <- topTags(PO.WF, n=NULL)
+PO.WF <- PO.WF$table
+PO.WF.list <- row.names(subset(PO.WF, logFC > 2 & FDR<0.001)) #1106 genes
+PO.WF.all <- row.names(subset(PO.WF, logFC > 0 & FDR<0.001)) #1683 genes
+######################################################################################################
+
+#FB:4787 genes expressed
+
+keep.exprs <- row.names(FRT) %in% cpmFRT.FB
+FRT.keep.FB <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.FB <- FRT.keep.FB[,grep('U', FRT.keep.FB$samples$time)]
+FRT.keep.FB <- FRT.keep.FB[,grep('FB|WF', FRT.keep.FB$samples$tissue)]
+FRT.keep.norm.FB <- calcNormFactors(FRT.keep.FB, method="TMM")
+
+design <- model.matrix(~0 + FRT.keep.norm.FB$samples$run + FRT.keep.norm.FB$samples$group)
+row.names(design) <- colnames(FRT.keep.norm.FB)
+colnames(design) = c("run", "FB", "WF")
+FB.contrasts = makeContrasts(FB.U.WF=FB-WF, levels=design)
+
+FRT.keep.norm.FB <- estimateDisp(FRT.keep.norm.FB, design, robust=T)
+FRT.keep.norm.FB$common.dispersion
+plotBCV(FRT.keep.norm.FB)
+FB.WF <- glmFit(FRT.keep.norm.FB, design, robust = T)
+FB.WF <- glmLRT(FB.WF, contrast = FB.contrasts) 
+FB.WF <- topTags(FB.WF, n=NULL)
+FB.WF <- FB.WF$table
+FB.WF.list <- row.names(subset(FB.WF, logFC > 2 & FDR<0.001)) #999 genes
+FB.WF.all <- row.names(subset(FB.WF, logFC > 0 & FDR<0.001)) #1356 genes
+######################################################################################################
+
+#Make data frame for analysis of each tissue and combine for supplemental data
+colnames(BUR.WF) <- paste("BUR", colnames(BUR.WF), sep = "_")
+colnames(OVD.WF) <- paste("OVD", colnames(OVD.WF), sep = "_")
+colnames(SR.WF) <- paste("SR", colnames(SR.WF), sep = "_")
+colnames(ST.WF) <- paste("ST", colnames(ST.WF), sep = "_")
+colnames(PO.WF) <- paste("PO", colnames(PO.WF), sep = "_")
+colnames(FB.WF) <- paste("FB", colnames(FB.WF), sep = "_")
+
+BUR.WF$FBgn <- rownames(BUR.WF)
+OVD.WF$FBgn <- rownames(OVD.WF)
+SR.WF$FBgn <- rownames(SR.WF)
+ST.WF$FBgn <- rownames(ST.WF)
+PO.WF$FBgn <- rownames(PO.WF)
+FB.WF$FBgn <- rownames(FB.WF)
+
+#write supplemental table with log2FC and pvalue for each tissue compared to WF
+Supp1.WF <- Reduce(function(...) merge(..., by='FBgn', all=TRUE), list(BUR.WF, OVD.WF, SR.WF, ST.WF, PO.WF, FB.WF))
+write.table(Supp1.WF, "Supp1.WF.txt", col.names=T, row.names=F)
+```
+
+Compare across tissues the number of genes expressed & enriched comprared to the WF
+```{r}
+exprs.genes <- data.frame(c("BUR", "OVD", "SR", "ST", "PO", "FB"), 
+                          c(length(cpmFRT.BUR),length(cpmFRT.OVD),length(cpmFRT.SR),length(cpmFRT.ST),length(cpmFRT.PO),length(cpmFRT.FB)),
+                          c(length(BUR.WF.list),length(OVD.WF.list),length(SR.WF.list),length(ST.WF.list),length(PO.WF.list),length(FB.WF.list)))
+colnames(exprs.genes) <- c("tissue", "total", "enriched")
+exprs.genes$`Tissue and WF` <- exprs.genes$total - exprs.genes$enriched
+exprs.genes <- exprs.genes[,c(1,3:4)]
+exprs.genes <- melt(exprs.genes, id="tissue")
+exprs.genes$tissue <- factor(exprs.genes$tissue, levels=c("SR", "OVD", "ST", "BUR", "PO", "FB"))
+exprs.genes$tissue2 <- c("BUR", "OVD", "SR", "ST", "PO", "FB", rep("Tissue and WF", 6))
+exprs.genes$tissue2 <- factor(exprs.genes$tissue2, levels=c("SR", "OVD", "ST", "BUR", "PO", "FB", "Tissue and WF"))
+
+#tiff('Fig3A.EpressedEnriched.tiff', units="in", width=5.5, height=5, res=300)
+ggplot(exprs.genes, aes(y = value, x= tissue, fill = tissue2, color=tissue)) + 
+  geom_bar(stat="identity", size =1.5) +
+  scale_color_manual(values=c(sr.col, ovd.col, st.col, bur.col, po.col, "thistle1", "grey65")) +
+  scale_fill_manual(values=c("black", "black", "black", "black", "black", "black", "grey65")) +
+  labs(x="Tissue", y="Number of Genes") +
+  theme_classic() +
+  theme(legend.position="none")
+#dev.off()
+```
+
+Compare number of genes in each tissue transcriptome (significant differences)
+Compare number of genes enriched in each tissue (significant differences)
+```{r}
+#Create data frame of number of genes expressed in each tissue and number not expressed (compared to both whole genome and FRT expressed genes)
+cpmFRT.chi <- data.frame(c("BUR", "OVD", "SR","ST","PO","FB","WF"), 
+              c(length(cpmFRT.BUR), length(cpmFRT.OVD), length(cpmFRT.SR), length(cpmFRT.ST), length(cpmFRT.PO), length(cpmFRT.FB), length(cpmFRT.WF)))
+colnames(cpmFRT.chi) <- c("tissue", "cpm2")
+cpmFRT.chi$not <- 17752 - cpmFRT.chi$cpm2
+cpmFRT.chi$not2 <- 8337 - cpmFRT.chi$cpm2
+
+# contingency test, is the proortion of genes that are expressed in each tissue (not including WF) different?
+chisq.test(cpmFRT.chi[c(1:6),c(2:3)], correct = T)
+chisq.test(cpmFRT.chi[c(1:6),c(2:3)], correct = T)$p.value
+# Yes! Highly significant chi-sq = 1364, p< 0.0001
+# The FB has a much lower number of genes than any other tissue
+
+# create data frame of number of genes expressed in each tissue & number tissue enriched
+WF.list.chi <- data.frame(c("BUR", "OVD", "SR", "ST", "PO", "FB"),
+              c(length(cpmFRT.BUR), length(cpmFRT.OVD), length(cpmFRT.SR), length(cpmFRT.ST), length(cpmFRT.PO), length(cpmFRT.FB)),
+              c(length(BUR.WF.list), length(OVD.WF.list), length(SR.WF.list), length(ST.WF.list), length(PO.WF.list), length(FB.WF.list)))
+colnames(WF.list.chi) <- c("tissue", "total", "tissue2")
+WF.list.chi$WF <- WF.list.chi$total - WF.list.chi$tissue2
+
+# contingency test, is the proportion of genes that are tissue enriched different?
+chisq.test(WF.list.chi[,c(3:4)], correct = T) 
+chisq.test(WF.list.chi[,c(3:4)], correct = T)$p.value
+#Yes! Highly significant chi-sq = 120.9, p< 0.0001
+
+# look at proportions
+WF.list.chi$proportion <- WF.list.chi$tissue2 / WF.list.chi$total
+# The ST and PO have lower proportions than the other tissues
+```
+
+Compare across tissue what genes enriched
+Identify genes that are commonly higher expressed in FRT tissues, epithelial tissues, and glandular tissues for GO analysis
+```{r}
+# visualize overlaps of all
+listInput <- list( BUR = BUR.WF.list, OVD = OVD.WF.list, SR = SR.WF.list, ST = ST.WF.list, PO = PO.WF.list)
+upset(fromList(listInput), keep.order=T, order.by = "freq", nsets=5, nintersects = NA, sets.bar.color= c(sr.col, ovd.col, bur.col, po.col, st.col))
+
+# visualize overlaps up to the last individual tissue set
+#tiff('Fig3B.EnrichOverlap.tiff', units="in", width=5, height=5, res=300)
+upset(fromList(listInput), keep.order=T, order.by = "freq", nsets=6, nintersects = 8, sets.bar.color= c(sr.col, ovd.col, bur.col, po.col, st.col))
+#dev.off()
+
+# extract from list of overlaps those that are enriched in all FRT tissues, epithelial tissues, glandular tissues, and any FRT tissue
+WF.list <- fromList(listInput)
+
+#Identify genes that are 'All FRT'
+WF.list.FRT <- rownames(subset(WF.list, WF.list$BUR ==1 & WF.list$OVD ==1 & WF.list$SR ==1 & WF.list$ST == 1 & WF.list$PO ==1 ))
+write.table(WF.list.FRT, "WF.list.FRT.txt", quote=F, row.names=F)
+
+#Identify genes that are 'Epithelial'
+WF.list.Epithelial <- rownames(subset(WF.list, WF.list$BUR ==1 & WF.list$OVD == 1 & WF.list$SR == 1 & WF.list$ST == 0 & WF.list$PO == 0))
+write.table(WF.list.Epithelial, "WF.list.epithelial.txt", quote=F, row.names=F)
+
+#Identify genes that are 'Glandular'
+WF.list.Gland <- rownames(subset(WF.list, WF.list$BUR == 0 & WF.list$OVD == 0 & WF.list$SR == 0 & WF.list$ST == 1 & WF.list$PO == 1))
+write.table(WF.list.Gland, "WF.list.gland.txt", quote=F, row.names=F)
+
+#Identify genes that are enriched in sperm storage organs
+WF.list.spermstorage <- rownames(subset(WF.list, WF.list$BUR == 0 & WF.list$OVD == 0 & WF.list$SR == 1 & WF.list$ST == 1 & WF.list$PO == 0))
+write.table(WF.list.spermstorage, "WF.list.spermstorage.txt", quote=F, row.names=F)
+
+#Identify genes that are FRT enriched (i.e., higher in any FRT tissue compared to the WF)
+WF.list.any <- rownames(subset(WF.list, WF.list$BUR == 1 | WF.list$OVD == 1 | WF.list$SR == 1 | WF.list$ST == 1 | WF.list$PO == 1))
+
+```
+
+```{r}
+FB.enrich.overlap <- c(
+length(which(FB.WF.list %in% BUR.WF.list)),
+length(which(FB.WF.list %in% OVD.WF.list)),
+length(which(FB.WF.list %in% SR.WF.list)), 
+length(which(FB.WF.list %in% ST.WF.list)), 
+length(which(FB.WF.list %in% PO.WF.list))) 
+
+FB.enrich.overlap <- FB.enrich.overlap / 
+  c(length(BUR.WF.list), length(OVD.WF.list), length(SR.WF.list), length(ST.WF.list), length(PO.WF.list))
+
+FB.enrich.overlap
+mean(FB.enrich.overlap) #0.226
+sd (FB.enrich.overlap) # 0.03
+
+FB.enrich.overlap <- c(
+length(which(FB.WF.list %in% BUR.WF.list)),
+length(which(FB.WF.list %in% OVD.WF.list)),
+length(which(FB.WF.list %in% SR.WF.list)), 
+length(which(FB.WF.list %in% ST.WF.list)), 
+length(which(FB.WF.list %in% PO.WF.list))) 
+
+FB.enrich.overlap <- cbind(FB.enrich.overlap, 
+                           c( length(BUR.WF.list), length(OVD.WF.list), length(SR.WF.list), length(ST.WF.list), length(PO.WF.list)) - FB.enrich.overlap)
+colnames(FB.enrich.overlap) <- c("FB.overlap", "Not")
+
+chisq.test(FB.enrich.overlap)
+
+chisq.test(FB.enrich.overlap[c(1:2),])$p.value * 10
+chisq.test(FB.enrich.overlap[c(1:3),])$p.value * 10 # 0.006
+chisq.test(FB.enrich.overlap[c(1:4),])$p.value * 10 # 0.013
+chisq.test(FB.enrich.overlap[c(1:5),])$p.value * 10 # 0.0002
+chisq.test(FB.enrich.overlap[c(2:3),])$p.value * 10 # 0.0014
+chisq.test(FB.enrich.overlap[c(2:4),])$p.value * 10 # 0.004
+chisq.test(FB.enrich.overlap[c(2:5),])$p.value * 10 # < 0.001
+chisq.test(FB.enrich.overlap[c(3:4),])$p.value * 10
+chisq.test(FB.enrich.overlap[c(3:5),])$p.value * 10
+chisq.test(FB.enrich.overlap[c(4:5),])$p.value * 10
+
+#so 3,4,5 not different
+# and 1,2 not different
+#but 1,2 sig < 3,4,5 i.e., BUR & OVD have less overlap of enriched genes with the FB than the SR, ST or PO...
+
+```
+
+
+Use Tau to identify determine tissue specificity of each gene and identify a set of tissue specific genes
+```{r}
+#apply tau to average unmated expression of each tissue and the WF
+# included the WF as a proxy for all other tissues. However, it creates an artifact of things that are labeled "WF" tissue specific which just means that it has highest expression in the WF compared to any tissue.
+tau.avgCPM <- data.frame(apply(Avg.CPM.U,1, tau))
+tau.avgCPM$FBgn <- row.names(tau.avgCPM)
+colnames(tau.avgCPM) <- c("tau", "FBgn")
+
+#create a categorical varialb of different levels of tau
+tau.avgCPM$cat <- with(tau.avgCPM, ifelse(tau.avgCPM$tau > 0.90, "t 0.90 - 1", 
+                                ifelse(tau.avgCPM$tau > 0.8 & tau.avgCPM$tau < 0.90, "t 0.8 - 0.9", 
+                                ifelse(tau.avgCPM$tau > 0.7 &  tau.avgCPM$tau < 0.8,"t 0.7 - 0.8", 
+                                ifelse(tau.avgCPM$tau > 0.5 &  tau.avgCPM$tau < 0.7, "t 0.5 - 0.7", "t 0.0 - 0.5") ))))
+
+# join tau with unmated expression levels and save supplemental file
+tau.avgCPM <- left_join(rownames_to_column(tau.avgCPM), rownames_to_column(Avg.log.U))
+tau.avgCPM <- rownames.first(tau.avgCPM)
+
+# for tissue specific genes determine which tissue has maxiumum expression
+tau.avgCPM$max <- apply(tau.avgCPM[,c(4:10)],1, which.max )
+tau.avgCPM$tissuemax <- with(tau.avgCPM, ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==1, "BUR", 
+                                   ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==2, "FB", 
+                                   ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==3, "OVD", 
+                                   ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==4, "PO", 
+                                   ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==5, "SR", 
+                                   ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==6, "ST", 
+                                   ifelse(tau.avgCPM$tau > 0.9 & tau.avgCPM$max ==7, "WF", "NotSpec"))))))))
+# make list of each set of tissue specific genes
+BUR.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "BUR")) #109 genes
+write.table (BUR.spec, "BUR.spec.txt", quote = F, row.names=F)
+OVD.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "OVD")) #80 genes
+write.table (OVD.spec, "OVD.spec.txt", quote = F, row.names=F)
+SR.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "SR")) #145 genes
+write.table (SR.spec, "SR.spec.txt", quote = F, row.names=F)
+ST.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "ST")) #105 genes
+write.table (ST.spec, "ST.spec.txt", quote = F, row.names=F)
+PO.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "PO")) #72 genes
+write.table (PO.spec, "PO.spec.txt", quote = F, row.names=F)
+FB.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "FB")) #429 genes
+write.table (FB.spec, "FB.spec.txt", quote = F, row.names=F)
+WF.spec <- rownames(subset(tau.avgCPM, tau.avgCPM$tissuemax == "WF")) #172 genes
+
+write.table(tau.avgCPM[,c(2,1,12)], "Supp1.tau.txt", row.names=F, col.names=T)
+```
+
+Looking at overlap between enriched and specific
+```{r}
+#How many tissue specific genes are enriched in that tissue
+mean(c(
+length(which(BUR.spec %in% BUR.WF.list))/ length(BUR.spec),
+length(which(OVD.spec %in% OVD.WF.list))/ length(OVD.spec),
+length(which(SR.spec %in% SR.WF.list))/ length(SR.spec),
+length(which(ST.spec %in% ST.WF.list))/ length(ST.spec),
+length(which(PO.spec %in% PO.WF.list))/ length(PO.spec),
+length(which(FB.spec %in% FB.WF.list))/ length(FB.spec)))
+# 97%
+
+st.err(c(
+length(which(BUR.spec %in% BUR.WF.list))/ length(BUR.spec),
+length(which(OVD.spec %in% OVD.WF.list))/ length(OVD.spec),
+length(which(SR.spec %in% SR.WF.list))/ length(SR.spec),
+length(which(ST.spec %in% ST.WF.list))/ length(ST.spec),
+length(which(PO.spec %in% PO.WF.list))/ length(PO.spec),
+length(which(FB.spec %in% FB.WF.list))/ length(FB.spec)))
+# 0.7%
+
+#There are a few tissue specific genes that are not expressed significantly higher than the WF in that tissue. These are all lowely expressed genes that likely did not make the significance cutoff.
+```
+
+test if differences in number of tissue specific genes
+They are different! Especially the FB
+```{r}
+# create data frame of number of tissue specific genes 
+cpmFRT.chi <- data.frame(c("BUR", "OVD", "SR","ST","PO", "FB"), 
+              c(length(cpmFRT.BUR), length(cpmFRT.OVD), length(cpmFRT.SR), length(cpmFRT.ST), length(cpmFRT.PO), length(cpmFRT.FB)),
+              c(length(BUR.spec), length(OVD.spec), length(SR.spec), length(ST.spec), length(PO.spec),length(FB.spec)))
+colnames(cpmFRT.chi) <- c("tissue","expr", "spec")
+
+cpmFRT.chi$not <- cpmFRT.chi$expr - cpmFRT.chi$spec
+
+#Is the number of tissue specific genes different?
+chisq.test(cpmFRT.chi[,c(3,4)], correct = T) 
+chisq.test(cpmFRT.chi[,c(3,4)], correct = T)$p.value
+#Yes! Highly significant chi-sq = 1085.3, p<0.0001
+
+#There are a few tissue specific genes that are not expressed significantly higher than the WF in that tissue. These are all lowely expressed genes that likely did not make the significance cutoff.
+```
+
+Tissue specific + signal
+All tissue specific genes had a significant enrichment for UniProt Signal annotation - looked into this pattern further
+```{r}
+#make dataframe that identifies number of tissue specific with signal & prepare for making figure
+spec.genes <- data.frame(c("BUR", "OVD", "SR", "ST", "PO", "FB"), 
+                         c(length(BUR.spec), length(OVD.spec), length(SR.spec), length(ST.spec), length(PO.spec), length(FB.spec)), 
+                         c(length(subset(BUR.spec, BUR.spec %in% signal$FBgn)), length(subset(OVD.spec, OVD.spec %in% signal$FBgn)), 
+                           length(subset(SR.spec, SR.spec %in% signal$FBgn)), length(subset(ST.spec, ST.spec %in% signal$FBgn)), 
+                           length(subset(PO.spec, PO.spec %in% signal$FBgn)), length(subset(FB.spec, FB.spec %in% signal$FBgn))))
+colnames(spec.genes) <- c("Tissue", "Total", "Signal")
+spec.genes$NotSignal <- spec.genes$Total - spec.genes$Signal
+spec.genes <- spec.genes[,c(1,3,4)]
+spec.genes <- melt(spec.genes, id="Tissue")
+spec.genes$Tissue <- factor(spec.genes$Tissue, levels=c("FB", "SR", "BUR", "ST", "OVD", "PO"))
+spec.genes$tissue2 <- c(rep("signal", 6), "BUR", "OVD", "SR", "ST", "PO", "FB")
+spec.genes$tissue2 <- factor(spec.genes$tissue2, levels=c("signal","FB","SR", "BUR", "ST", "OVD", "PO"))
+
+#Visualize tissue specific genes and the proportion that have a signal annotation
+#tiff('Fig3C.TissueSpecSecreted.tiff', units="in", width=5.5, height=5, res=300)
+ggplot(spec.genes, aes(y = value, x= Tissue, fill = tissue2, color=Tissue)) + 
+  geom_bar(stat="identity", size=1.5) +
+  scale_color_manual(values=c("thistle1", sr.col, bur.col, st.col, ovd.col, po.col, "grey65")) +
+  scale_fill_manual(values=c("red", "grey65",  "grey65", "grey65", "grey65", "grey65", "grey65")) +
+  labs(x="Tissue", y="Number of Genes") +
+  theme_classic() +
+  theme(legend.position="none")
+
+```
+
+Look at the interaction between specificity and signal
+```{r}
+#combine tau + average expression with signal to see which genes have a signal annotation
+tau.signal <- left_join(tau.avgCPM, signal)
+tau.signal$Signal[is.na(tau.signal$Signal)] <- "No Signal"
+tau.signal$genes <- "genes"
+
+#plot the density curves across tau for genes with or without a signal annotation
+#tiff('Fig3B.tiff', units="in", width=5, height=5, res=300)
+ggplot(tau.signal, aes(x=tau, y=genes, fill=Signal))+ 
+  geom_density_ridges(alpha=0.5) + 
+  scale_fill_manual(values=c("grey75", "red")) +
+  theme_classic()+
+  labs(x="Tissue Specificity (Tau)", y="Density of Genes") +
+  scale_x_continuous(breaks=c(0,0.5, 0.7, 0.8, 0.9,1)) +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        legend.position = "none")
+#dev.off()
+
+tau.signal.only <- subset(tau.signal, tau.signal$Signal == "Signal")
+tau.signal.only <- tau.signal.only[,c(1,5,13)]
+tau.nosignal.only <- subset(tau.signal, tau.signal$Signal == "No Signal")
+tau.nosignal.only <- tau.nosignal.only[,c(1,5,13)]
+
+#Kolmogorov-Smirnov test
+#tests if the two samples came from the same distribution - they do not.
+ks.test(tau.signal.only$tau, tau.nosignal.only$tau, alternative = "two.sided")
+ks.test(tau.signal.only$tau, tau.nosignal.only$tau, alternative = "two.sided")$p.value
+#D = 0.33586, p-value < 2.2e-16
+```
+
+
+Look into how genes fall throughout tissue specific categories
+They are pretty uneven - but these categories are the best to caputre the dynamics of tissue specific genes
+```{r}
+#determine the number of genes in each tau category
+cat.count <- tau.signal %>%
+  group_by(cat) %>%
+  summarise(count=n())
+
+#determine number of genes by tau category and secretion
+cat.countsignal <- tau.signal %>%
+  group_by(cat, Signal) %>%
+  summarise(count=n())
+
+mean(cat.count$count)
+st.err(cat.count$count)
+
+mean(subset(cat.countsignal$count, cat.countsignal$Signal == "Signal"))
+st.err(subset(cat.countsignal$count, cat.countsignal$Signal == "Signal"))
+
+
+# difference in category size between less and more tissue specific categories
+mean(2218, 2493) / mean(1255,1259,1112)
+# less specific categories have 1.76 times more genes
+
+#difference in number of secreted genes among tissue specific categories
+462 / mean (121, 242,180,231)
+# tissue specific genes have 3.8 times as many secreted genes
+```
+
+Heatmap of FRT tissue specific genes
+(this excludes the FB because there are so many of them)
+```{r}
+#Supset for only tissue specific genes in a FRT tissue
+tau.avgCPM.spec <- subset(tau.avgCPM, tau.avgCPM$tissuemax != "NotSpec" & tau.avgCPM$tissuemax != "WF" & tau.avgCPM$tissuemax != "FB")
+
+#add signal annotation
+tau.avgCPM.spec <- left_join(tau.avgCPM.spec, signal)
+tau.avgCPM.spec$Signal[is.na(tau.avgCPM.spec$Signal)] <- "No Signal"
+tau.avgCPM.spec <- data.frame(tau.avgCPM.spec[,-2], row.names = tau.avgCPM.spec[,2])
+tau.avgCPM.spec <- tau.avgCPM.spec[,c(3:9, 11, 12)]
+
+my_sample_col <- data.frame(Name = c("BUR", "FB", "OVD", "PO", "SR", "ST", "WF"))
+row.names(my_sample_col) <- colnames(tau.avgCPM.spec[,-c(8,9)])
+
+#define annotation colors for collumn and rows
+ann_colors <- list(
+              tissuemax=c("BUR"= bur.col, "OVD" = ovd.col, "SR" = sr.col, "ST" = st.col,"PO" = po.col,"FB" = fb.col, "WF" = "grey65" ), 
+              Signal=c("Signal"="red","No Signal"= "white"), 
+              Name=c("BUR"=bur.col, "OVD"= ovd.col, "PO"=po.col, "SR"=sr.col, "ST"=st.col, "FB" = fb.col, "WF" = "grey65"))
+breaksList = seq(0, 20, by = 0.02)
+
+#used euclidean because then grouping seems to be based on patterns of expression across all tissues for each gene rather than similarities within a tissue and reveals some nice patterns of tissue specific gene dynamics across the FRT
+#tiff('FigS2.TissueSpecHeatmap.tiff', units="in", width=7, height=13, res=300)
+pheatmap(scale(as.matrix(tau.avgCPM.spec[,-c(8,9)]), center=F, scale=F), 
+         clustering_distance_cols = "euclidean",
+         clustering_distance_rows = "euclidean",
+        clustering_method = "complete",
+         annotation_row = tau.avgCPM.spec[,c(8,9)],
+         annotation_col = my_sample_col,
+        color = colorRampPalette(c("white", "grey75","grey50", "grey25",  "black"))
+(length(breaksList) - 1), 
+         breaks = breaksList,
+        annotation_colors = ann_colors,
+        labels_col = c("BUR","FB", "OVD", "PO", "SR", "ST", "WF"),
+        show_rownames = F,
+        annotation_legend = T,
+        annotation_names_row = F,
+        annotation_names_col = F,
+        legend =T)
+#dev.off()
+```
+
+Analysis of evolutionary rate
+remove outliers  from data and combine with the FRT gene expression
+```{r}
+mean(paml_all$ML.dS) #0.42
+st.err(paml_all$ML.dS)#0.02
+mean(paml_all$ML.dN) #0.05
+st.err(paml_all$ML.dN)#0.0006
+
+#remove any paml outliers
+paml_all <- subset(paml_all, paml_all$ML.dS < mean(paml_all$ML.dS)*5) 
+paml_all <- subset(paml_all, paml_all$ML.dN < mean(paml_all$ML.dN)*5)
+paml_all <- subset(paml_all, paml_all$ML.omega < 50)
+#11671
+
+quantile(paml_all$ML.omega, c(.75, .8, .9, .95), na.rm=T) # For all genes > 0.28 is in the 90th percentile and > 0.37 is in the 95th percentile
+
+tau.signal.paml <- right_join(paml_all, tau.signal)
+length(subset(tau.signal.paml$ML.omega, tau.signal.paml$ML.omega >= 0 ))/8337
+#87% of genes have a ML.omega value
+
+quantile(tau.signal.paml$ML.omega, c(.75, .8, .9, .95), na.rm=T) # For genes in the FRT > 0.27 is in the 95th percentile 
+
+```
+
+
+Look at distribution of data (box plot showing points) separated by tau category and signal
+```{r}
+#look at raw data box plot & points
+ggplot(tau.signal.paml, aes(x=Signal, y=ML.omega))+
+  #geom_jitter(aes(color = Signal), shape=19, position=position_jitter(0.2), size=0.5, alpha=0.5) +
+  scale_color_manual(values=c("grey35", "red")) +
+  geom_boxplot(outlier.colour = "black", col=c("#000000", "#000000", "gray19","#67001f","gray38","#b2182b", "gray58", "#d60303", "gray75","#ff0000"), fill=NA) + 
+  facet_wrap(~cat, strip.position = "bottom", ncol=5)+
+  theme_classic() + theme(legend.position="none") + labs(y = "Omega (dN/ dS)", x="Tissue Specificity")+
+  scale_y_continuous(limits = c(0,1))
+
+#clear differences but hard to see because of scale. Look at bootstrap mean + ci bootstrap instead of all data
+```
+
+Bootstrap the mean omega value and 95 confidence intervals around the mean based on tau category and signal
+```{r}
+paml.boot <- tau.signal.paml
+paml.boot <- paml.boot[,c(1,4,6, 16)]
+paml.boot <- paml.boot %>% unite("unite", cat, Signal, remove=T)
+paml.boot <- spread(paml.boot, unite, ML.omega)
+
+boot.0.s <- boot(data=na.omit(paml.boot$`t 0.0 - 0.5_Signal`), statistic=meanfun, R=2000)
+boot.ci.0.s <- boot.ci(boot.0.s, conf=0.95, type="bca")$bca
+boot.0.ns <- boot(data=na.omit(paml.boot$`t 0.0 - 0.5_No Signal`), statistic=meanfun, R=2000)
+boot.ci.0.ns <- boot.ci(boot.0.ns, conf=0.95, type="bca")$bca
+
+boot.0.5.s <- boot(data=na.omit(paml.boot$`t 0.5 - 0.7_Signal`), statistic=meanfun, R=2000)
+boot.ci.0.5.s <- boot.ci(boot.0.5.s, conf=0.95, type="bca")$bca
+boot.0.5.ns <- boot(data=na.omit(paml.boot$`t 0.5 - 0.7_No Signal`), statistic=meanfun, R=2000)
+boot.ci.0.5.ns <- boot.ci(boot.0.5.ns, conf=0.95, type="bca")$bca
+
+boot.0.7.s <- boot(data=na.omit(paml.boot$`t 0.7 - 0.8_Signal`), statistic=meanfun, R=2000)
+boot.ci.0.7.s <- boot.ci(boot.0.7.s, conf=0.95, type="bca")$bca
+boot.0.7.ns <- boot(data=na.omit(paml.boot$`t 0.7 - 0.8_Signal`), statistic=meanfun, R=2000)
+boot.ci.0.7.ns <- boot.ci(boot.0.7.ns, conf=0.95, type="bca")$bca
+
+boot.0.8.s <- boot(data=na.omit(paml.boot$`t 0.8 - 0.9_Signal`), statistic=meanfun, R=2000)
+boot.ci.0.8.s <- boot.ci(boot.0.8.s, conf=0.95, type="bca")$bca
+boot.0.8.ns <- boot(data=na.omit(paml.boot$`t 0.8 - 0.9_No Signal`), statistic=meanfun, R=2000)
+boot.ci.0.8.ns <- boot.ci(boot.0.8.ns, conf=0.95, type="bca")$bca
+
+boot.0.9.s <- boot(data=na.omit(paml.boot$`t 0.90 - 1_Signal`), statistic=meanfun, R=2000)
+boot.ci.0.9.s <- boot.ci(boot.0.9.s, conf=0.95, type="bca")$bca
+boot.0.9.ns <- boot(data=na.omit(paml.boot$`t 0.90 - 1_No Signal`), statistic=meanfun, R=2000)
+boot.ci.0.9.ns <- boot.ci(boot.0.9.ns, conf=0.95, type="bca")$bca
+
+boot.paml <- data.frame(
+  c("0 - 0.5", "0 - 0.5", "0.5 - 0.7", "0.5 - 0.7", "0.7 - 0.8", "0.7 - 0.8", "0.8 - 0.9", "0.8 - 0.9", "0.9 - 1", "0.9 - 1"),
+  c(rep(c("Not Secreted", "Secreted"),5)), 
+  c(mean(boot.0.ns$t),mean(boot.0.s$t),mean(boot.0.5.ns$t),mean(boot.0.5.s$t),mean(boot.0.7.ns$t),mean(boot.0.7.s$t), mean(boot.0.8.ns$t),mean(boot.0.8.s$t), mean(boot.0.9.ns$t),mean(boot.0.9.s$t)), 
+  c(boot.ci.0.ns[4], boot.ci.0.s[4], boot.ci.0.5.ns[4], boot.ci.0.5.s[4], boot.ci.0.7.ns[4], boot.ci.0.7.s[4], 
+    boot.ci.0.8.ns[4], boot.ci.0.8.s[4], boot.ci.0.9.ns[4], boot.ci.0.9.s[4]),
+  c(boot.ci.0.ns[5], boot.ci.0.s[5], boot.ci.0.5.ns[5], boot.ci.0.5.s[5], boot.ci.0.7.ns[5], boot.ci.0.7.s[5], 
+    boot.ci.0.8.ns[5], boot.ci.0.8.s[5], boot.ci.0.9.ns[5], boot.ci.0.9.s[5]))
+colnames(boot.paml) <- c("TissueSpecificity", "Signal", "boot.mean", "boot.ci.neg", "boot.ci.pos")
+
+boot.paml$Tissue <- factor(boot.paml$TissueSpecificity, levels=c("0 - 0.5", "0.5 - 0.7", "0.7 - 0.8", "0.8 - 0.9", "0.9 - 1"))
+
+
+#tiff('Fig4A.boot.EvoTissueSpecificity.tiff', units="in", width=8, height=5, res=300)
+ggplot(boot.paml, aes(x=Signal, y=boot.mean))+
+  geom_errorbar(aes(ymin=boot.ci.neg, ymax=boot.ci.pos),width=.2, size=1, position=position_dodge(.9), col=c("gray75", "gray75", "gray58","gray58","gray38","gray38", "gray19", "gray19", "#000000","#000000"))+
+      geom_point(size=3.5, col=c("grey75", "red", "grey75", "red", "grey75", "red", "grey75", "red", "grey75","red")) +
+  facet_wrap(~Tissue, strip.position = "bottom", ncol=7)+
+  theme_classic() + theme(legend.position="none") + labs(y = "Omega (dN/ dS)", x="Tissue Specificity (Tau)")
+#dev.off()
+
+```
+
+
+statistics on evolutionary rate (dN/dS or omega) across all FRT-expressed genes based on tissue specificity categoy, signal annotation, and the interaction. 
+correct pvalue by multiply by 6 to account for the analysis on 3 factors for this data and 3 factors on the tissue specific data (below)
+```{r}
+#stats
+tau.signal.paml.stats <- tau.signal.paml[,c(1,4,5,6,15,16)]
+tau.signal.paml.stats <- na.omit(tau.signal.paml.stats)
+tau.signal.paml.stats$cat <- as.factor(tau.signal.paml.stats$cat)
+tau.signal.paml.stats$Signal <- as.factor(tau.signal.paml.stats$Signal)
+
+#Doing a Kruskal-Wallace test on each of the explanatory factors individually and correcting for multiple testing
+tau.cat <- kruskal.test(tau.signal.paml.stats$ML.omega, tau.signal.paml.stats$cat)
+tau.cat
+tau.cat$p.value * 6 
+
+tau.signal <- kruskal.test(tau.signal.paml.stats$ML.omega, tau.signal.paml.stats$Signal)
+tau.signal
+tau.signal$p.value * 6 
+
+interaction.tau.stats <- interaction(tau.signal.paml.stats$Signal,tau.signal.paml.stats$cat)
+tau.interaction <- kruskal.test(tau.signal.paml.stats$ML.omega, interaction.tau.stats)
+tau.interaction
+tau.interaction$p.value * 6 
+
+pairwise.wilcox.test(tau.signal.paml.stats$ML.omega, interaction.tau.stats, p.adjust.method= "bonferroni")
+# Signal 0.9 - 1 and 0.8 - 0.9 are both higher than all other genes without a signal
+# Signal 0.9 - 1 is also higher than all other signal except 0.9 - 0.9
+
+#Save evorate info
+tau.signal.paml.save <- right_join(convert, tau.signal.paml.stats, by=c("primary_FBgn" = "FBgn") )
+write.table(tau.signal.paml.save, "S5.PAML.txt", row.names = F, col.names = T)
+
+```
+
+Look at evolutionary rates just of tissue specific genes
+```{r}
+tau.signal.paml.spec <- subset(tau.signal.paml, tau.signal.paml$tissuemax != "NotSpec" & tau.signal.paml$tissuemax != "WF")
+tau.signal.paml.spec$tissue2 <- 
+  ifelse(tau.signal.paml.spec$tissuemax == "BUR", "BUR", 
+  ifelse(tau.signal.paml.spec$tissuemax == "OVD", "OVD", 
+  ifelse(tau.signal.paml.spec$tissuemax == "SR", "SR", 
+  ifelse(tau.signal.paml.spec$tissuemax == "ST", "ST",
+  ifelse(tau.signal.paml.spec$tissuemax == "PO", "PO",
+  ifelse(tau.signal.paml.spec$tissuemax == "FB", "FB", "NotTissue"))))))
+
+tau.signal.paml.spec$tissuemax <- factor(tau.signal.paml.spec$tissuemax, levels=c("BUR", "SR", "OVD", "ST", "FB", "PO"))
+
+
+ggplot(tau.signal.paml.spec, aes(x=Signal, y=ML.omega))+
+  geom_boxplot(outlier.colour="black", col=c(bur.col, bur.col, sr.col, sr.col, ovd.col, ovd.col, st.col, st.col,"pink", "pink", po.col, po.col))+
+  facet_wrap(~tissuemax, strip.position = "bottom", ncol=7)+
+  theme_classic() + theme(legend.position="none") + labs(y = "Omega (dN/ dS)", x="Tissue Specificity") +
+  scale_y_continuous(limits = c(0,0.8))
+
+#clear differences but hard to see because of scale. Look at bootstrap mean + ci bootstrap instead of all data
+
+```
+
+Boot strap mean and ci of mean to plot
+```{r}
+paml.spec.boot <- tau.signal.paml.spec
+paml.spec.boot <- paml.spec.boot[,c(1,4,15, 16)]
+paml.spec.boot <- paml.spec.boot %>% unite("unite", tissuemax, Signal, remove=T)
+paml.spec.boot <- spread(paml.spec.boot, unite, ML.omega)
+
+boot.BUR.s <- boot(data=na.omit(paml.spec.boot$BUR_Signal), statistic=meanfun, R=1000)
+boot.ci.BUR.s <- boot.ci(boot.BUR.s, conf=0.95, type="bca")$bca
+boot.BUR.ns <- boot(data=na.omit(paml.spec.boot$`BUR_No Signal`), statistic=meanfun, R=1000)
+boot.ci.BUR.ns <- boot.ci(boot.BUR.ns, conf=0.95, type="bca")$bca
+
+boot.OVD.s <- boot(data=na.omit(paml.spec.boot$OVD_Signal), statistic=meanfun, R=1000)
+boot.ci.OVD.s <- boot.ci(boot.OVD.s, conf=0.95, type="bca")$bca
+boot.OVD.ns <- boot(data=na.omit(paml.spec.boot$`OVD_No Signal`), statistic=meanfun, R=1000)
+boot.ci.OVD.ns <- boot.ci(boot.OVD.ns, conf=0.95, type="bca")$bca
+
+boot.SR.s <- boot(data=na.omit(paml.spec.boot$SR_Signal), statistic=meanfun, R=1000)
+boot.ci.SR.s <- boot.ci(boot.SR.s, conf=0.95, type="bca")$bca
+boot.SR.ns <- boot(data=na.omit(paml.spec.boot$`SR_No Signal`), statistic=meanfun, R=1000)
+boot.ci.SR.ns <- boot.ci(boot.SR.ns, conf=0.95, type="bca")$bca
+
+boot.ST.s <- boot(data=na.omit(paml.spec.boot$ST_Signal), statistic=meanfun, R=1000)
+boot.ci.ST.s <- boot.ci(boot.ST.s, conf=0.95, type="bca")$bca
+boot.ST.ns <- boot(data=na.omit(paml.spec.boot$`ST_No Signal`), statistic=meanfun, R=1000)
+boot.ci.ST.ns <- boot.ci(boot.ST.ns, conf=0.95, type="bca")$bca
+
+boot.PO.s <- boot(data=na.omit(paml.spec.boot$PO_Signal), statistic=meanfun, R=1000)
+boot.ci.PO.s <- boot.ci(boot.PO.s, conf=0.95, type="bca")$bca
+boot.PO.ns <- boot(data=na.omit(paml.spec.boot$`PO_No Signal`), statistic=meanfun, R=1000)
+boot.ci.PO.ns <- boot.ci(boot.PO.ns, conf=0.95, type="bca")$bca
+
+boot.FB.s <- boot(data=na.omit(paml.spec.boot$FB_Signal), statistic=meanfun, R=1000)
+boot.ci.FB.s <- boot.ci(boot.FB.s, conf=0.95, type="bca")$bca
+boot.FB.ns <- boot(data=na.omit(paml.spec.boot$`FB_No Signal`), statistic=meanfun, R=1000)
+boot.ci.FB.ns <- boot.ci(boot.FB.ns, conf=0.95, type="bca")$bca
+
+boot.paml <- data.frame(
+  c("BUR", "BUR", "SR", "SR","OVD", "OVD", "ST", "ST", "FB", "FB", "PO", "PO"),
+  c(rep(c("Not Secreted", "Secreted"),2)), 
+  c(mean(boot.BUR.ns$t),mean(boot.BUR.s$t),mean(boot.SR.ns$t),mean(boot.SR.s$t),mean(boot.OVD.ns$t),mean(boot.OVD.s$t), 
+    mean(boot.ST.ns$t),mean(boot.ST.s$t), mean(boot.FB.ns$t),mean(boot.FB.s$t), mean(boot.PO.ns$t),mean(boot.PO.s$t)),
+  c(boot.ci.BUR.ns[4], boot.ci.BUR.s[4], boot.ci.SR.ns[4], boot.ci.SR.s[4], boot.ci.OVD.ns[4], boot.ci.OVD.s[4], 
+    boot.ci.ST.ns[4], boot.ci.ST.s[4], boot.ci.FB.ns[4], boot.ci.FB.s[4], boot.ci.PO.ns[4], boot.ci.PO.s[4]),
+  c(boot.ci.BUR.ns[5], boot.ci.BUR.s[5], boot.ci.SR.ns[5], boot.ci.SR.s[5], boot.ci.OVD.ns[5], boot.ci.OVD.s[5], 
+    boot.ci.ST.ns[5], boot.ci.ST.s[5], boot.ci.FB.ns[5], boot.ci.FB.s[5], boot.ci.PO.ns[5], boot.ci.PO.s[5]))
+colnames(boot.paml) <- c("Tissue", "Signal", "boot.mean", "boot.ci.neg", "boot.ci.pos")
+
+boot.paml$Tissue <- factor(boot.paml$Tissue, levels=c("BUR", "SR", "OVD", "ST", "FB", "PO"))
+
+
+#tiff('Fig4B.boot.TissueSpecEvo.tiff', units="in", width=8, height=5, res=300)
+ggplot(boot.paml, aes(x=Signal, y=boot.mean))+
+  geom_errorbar(aes(ymin=boot.ci.neg, ymax=boot.ci.pos),width=.2, size=1, position=position_dodge(.9), col=c(bur.col, bur.col, sr.col, sr.col, ovd.col, ovd.col, st.col, st.col,"pink", "pink", po.col, po.col))+
+      geom_point(size=3.5, col=c("grey75", "red", "grey75", "red", "grey75", "red", "grey75", "red", "grey75","red", "grey75", "red")) +
+  facet_wrap(~Tissue, strip.position = "bottom", ncol=7)+
+  theme_classic() + theme(legend.position="none") + labs(y = "Omega (dN/ dS)", x="Tissue Specific (Tau > 0.9)")
+#dev.off()
+
+```
+
+statistical analysis of evo rate differences
+FDR adjusted for 6 comparisons (see above)
+```{r}
+tau.signal.paml.spec.stats <- tau.signal.paml.spec[,c(1,4,5,6,15,16,18)]
+tau.signal.paml.spec.stats <- na.omit(tau.signal.paml.spec.stats)
+tau.signal.paml.spec.stats$tissue2 <- as.factor(tau.signal.paml.spec.stats$tissue2)
+tau.signal.paml.spec.stats$Signal <- as.factor(tau.signal.paml.spec.stats$Signal)
+
+tau.spec.cat <- kruskal.test(tau.signal.paml.spec.stats$ML.omega, tau.signal.paml.spec.stats$tissue2)
+tau.spec.cat
+tau.spec.cat$p.value * 6
+
+tau.spec.signal <- kruskal.test(tau.signal.paml.spec.stats$ML.omega, tau.signal.paml.spec.stats$Signal)
+tau.spec.signal
+tau.spec.signal$p.value * 6
+
+interaction.tau.spec.stats <- interaction(tau.signal.paml.spec.stats$Signal,tau.signal.paml.spec.stats$tissue2)
+tau.spec.interaction <- kruskal.test(tau.signal.paml.spec.stats$ML.omega, interaction.tau.spec.stats)
+tau.spec.interaction
+tau.spec.interaction$p.value * 6
+
+pairwise.wilcox.test(tau.signal.paml.spec.stats$ML.omega, interaction.tau.spec.stats, p.adjust.method= "bonferroni")
+```
+
+
+
+Postmating analysis!
+Look at differential expression postmating (comparing unmated - 6, unamted -24 and 6 - 24). This was done in each tissue separately, and as before, was based on the normalized genes expressed in that tissue.
+```{r}
+#BUR: 6920 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.BUR
+write.table(cpmFRT.BUR, "BUR.background.txt", quote=F, row.names=F, col.names=F)
+
+FRT.keep.BUR <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.BUR <- FRT.keep.BUR[,grep('BUR', FRT.keep.BUR$samples$tissue)]
+FRT.keep.norm.BUR <- calcNormFactors(FRT.keep.BUR, method="TMM")
+plotMDS(FRT.keep.norm.BUR, col=rep(1:3, each=4))
+
+design <- model.matrix(~0 + FRT.keep.norm.BUR$samples$run + FRT.keep.norm.BUR$samples$time)
+row.names(design) <- colnames(FRT.keep.norm.BUR)
+colnames(design) = c("run", "PM.24h", "PM.6h", "Un")
+
+FRT.keep.norm.BUR <- estimateDisp(FRT.keep.norm.BUR, design, robust=T)
+FRT.keep.norm.BUR$common.dispersion
+plotBCV(FRT.keep.norm.BUR)
+
+BUR.post <- glmFit(FRT.keep.norm.BUR, design)
+
+#6h compared to unmated
+BUR.6hUn <- glmLRT(BUR.post, contrast = makeContrasts(PM6.Un = PM.6h - Un, levels= design)) 
+BUR.6hUn <- topTags(BUR.6hUn, n=NULL)
+BUR.6hUn <- BUR.6hUn$table
+colnames(BUR.6hUn) <- paste(colnames(BUR.6hUn), "6hUn", sep=".")
+
+BUR.6hUn.up <- subset(BUR.6hUn, BUR.6hUn$logFC.6hUn > 0 & BUR.6hUn$FDR.6hUn < 0.01)
+BUR.6hUn.up <- rownames(BUR.6hUn.up)
+write.table(BUR.6hUn.up, "BUR.6hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+BUR.6hUn.down <- subset(BUR.6hUn, BUR.6hUn$logFC.6hUn < 0 & BUR.6hUn$FDR.6hUn < 0.01)
+BUR.6hUn.down <- rownames(BUR.6hUn.down)
+write.table(BUR.6hUn.down, "BUR.6hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to unmated
+BUR.24hUn <- glmLRT(BUR.post, contrast = makeContrasts(PM24.Un = PM.24h - Un, levels = design)) 
+BUR.24hUn <- topTags(BUR.24hUn, n=NULL)
+BUR.24hUn <- BUR.24hUn$table
+colnames(BUR.24hUn) <- paste(colnames(BUR.24hUn), "24hUn", sep=".")
+
+BUR.24hUn.up <- subset(BUR.24hUn, BUR.24hUn$logFC > 0 & BUR.24hUn$FDR < 0.01)
+BUR.24hUn.up <- rownames(BUR.24hUn.up)
+write.table(BUR.24hUn.up, "BUR.24hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+BUR.24hUn.down <- subset(BUR.24hUn, BUR.24hUn$logFC < 0 & BUR.24hUn$FDR < 0.01)
+BUR.24hUn.down <- rownames(BUR.24hUn.down)
+write.table(BUR.24hUn.down, "BUR.24hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to 6h postmating
+BUR.24h6h <- glmLRT(BUR.post, contrast = makeContrasts(PM24.PM6 = PM.24h - PM.6h, levels= design)) 
+BUR.24h6h <- topTags(BUR.24h6h, n=NULL)
+BUR.24h6h <- BUR.24h6h$table
+colnames(BUR.24h6h) <- paste(colnames(BUR.24h6h), "24h6h", sep=".")
+
+BUR.24h6h.up <- subset(BUR.24h6h, BUR.24h6h$logFC.24h6h > 0 & BUR.24h6h$FDR.24h6h < 0.01)
+BUR.24h6h.up <- rownames(BUR.24h6h.up)
+write.table(BUR.24h6h.up, "BUR.24h6h.up.txt", quote=F, row.names=F, col.names = F)
+
+BUR.24h6h.down <- subset(BUR.24h6h, BUR.24h6h$logFC.24h6h < 0 & BUR.24h6h$FDR.24h6h < 0.01)
+BUR.24h6h.down <- rownames(BUR.24h6h.down)
+write.table(BUR.24h6h.down, "BUR.24h6h.down.txt", quote=F, row.names=F, col.names = F)
+
+######################################################################################################
+
+#OVD: 7644 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.OVD
+write.table(cpmFRT.OVD, "OVD.background.txt", quote=F, row.names=F, col.names=F)
+
+FRT.keep.OVD <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.OVD <- FRT.keep.OVD[,grep('OVD', FRT.keep.OVD$samples$tissue)]
+FRT.keep.norm.OVD <- calcNormFactors(FRT.keep.OVD, method="TMM")
+plotMDS(FRT.keep.norm.OVD, col=rep(1:3, each=4))
+
+design <- model.matrix(~0 + FRT.keep.norm.OVD$samples$run + FRT.keep.norm.OVD$samples$time)
+row.names(design) <- colnames(FRT.keep.norm.OVD)
+colnames(design) = c("run", "PM.24h", "PM.6h", "Un")
+
+FRT.keep.norm.OVD <- estimateDisp(FRT.keep.norm.OVD, design, robust=T)
+FRT.keep.norm.OVD$common.dispersion
+plotBCV(FRT.keep.norm.OVD)
+
+OVD.post <- glmFit(FRT.keep.norm.OVD, design)
+
+#6h compared to unmated
+OVD.6hUn <- glmLRT(OVD.post, contrast = makeContrasts(PM6.Un = PM.6h - Un, levels= design)) 
+OVD.6hUn <- topTags(OVD.6hUn, n=NULL)
+OVD.6hUn <- OVD.6hUn$table
+colnames(OVD.6hUn) <- paste(colnames(OVD.6hUn), "6hUn", sep=".")
+
+OVD.6hUn.up <- subset(OVD.6hUn, OVD.6hUn$logFC.6hUn > 0 & OVD.6hUn$FDR.6hUn < 0.01)
+OVD.6hUn.up <- rownames(OVD.6hUn.up)
+write.table(OVD.6hUn.up, "OVD.6hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+OVD.6hUn.down <- subset(OVD.6hUn, OVD.6hUn$logFC.6hUn < 0 & OVD.6hUn$FDR.6hUn < 0.01)
+OVD.6hUn.down <- rownames(OVD.6hUn.down)
+write.table(OVD.6hUn.down, "OVD.6hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to unmated
+OVD.24hUn <- glmLRT(OVD.post, contrast = makeContrasts(PM24.Un = PM.24h - Un, levels= design)) 
+OVD.24hUn <- topTags(OVD.24hUn, n=NULL)
+OVD.24hUn <- OVD.24hUn$table
+colnames(OVD.24hUn) <- paste(colnames(OVD.24hUn), "24hUn", sep=".")
+
+OVD.24hUn.up <- subset(OVD.24hUn, OVD.24hUn$logFC > 0 & OVD.24hUn$FDR < 0.01)
+OVD.24hUn.up <- rownames(OVD.24hUn.up)
+write.table(OVD.24hUn.up, "OVD.24hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+OVD.24hUn.down <- subset(OVD.24hUn, OVD.24hUn$logFC < 0 & OVD.24hUn$FDR < 0.01)
+OVD.24hUn.down <- rownames(OVD.24hUn.down)
+write.table(OVD.24hUn.down, "OVD.24hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to 6h
+OVD.24h6h <- glmLRT(OVD.post, contrast = makeContrasts(PM24.PM6 = PM.24h - PM.6h, levels= design)) 
+OVD.24h6h <- topTags(OVD.24h6h, n=NULL)
+OVD.24h6h <- OVD.24h6h$table
+colnames(OVD.24h6h) <- paste(colnames(OVD.24h6h), "24h6h", sep=".")
+
+OVD.24h6h.up <- subset(OVD.24h6h, OVD.24h6h$logFC.24h6h > 0 & OVD.24h6h$FDR.24h6h < 0.01)
+OVD.24h6h.up <- rownames(OVD.24h6h.up)
+write.table(OVD.24h6h.up, "OVD.24h6h.up.txt", quote=F, row.names=F, col.names = F)
+
+OVD.24h6h.down <- subset(OVD.24h6h, OVD.24h6h$logFC.24h6h < 0 & OVD.24h6h$FDR.24h6h < 0.01)
+OVD.24h6h.down <- rownames(OVD.24h6h.down)
+write.table(OVD.24h6h.down, "OVD.24h6h.down.txt", quote=F, row.names=F, col.names = F)
+
+######################################################################################################
+
+#SR: 7748 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.SR
+write.table(cpmFRT.SR, "SR.background.txt", quote=F, row.names=F, col.names=F)
+
+FRT.keep.SR <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.SR <- FRT.keep.SR[,grep('SR', FRT.keep.SR$samples$tissue)]
+FRT.keep.norm.SR <- calcNormFactors(FRT.keep.SR, method="TMM")
+plotMDS(FRT.keep.norm.SR, col=rep(1:3, each=4))
+
+design <- model.matrix(~0 + FRT.keep.norm.SR$samples$run + FRT.keep.norm.SR$samples$time)
+row.names(design) <- colnames(FRT.keep.norm.SR)
+colnames(design) = c("run", "PM.24h", "PM.6h", "Un")
+
+FRT.keep.norm.SR <- estimateDisp(FRT.keep.norm.SR, design, robust=T)
+FRT.keep.norm.SR$common.dispersion
+plotBCV(FRT.keep.norm.SR)
+
+SR.post <- glmFit(FRT.keep.norm.SR, design)
+
+#6h compared to unmated
+SR.6hUn <- glmLRT(SR.post, contrast = makeContrasts(PM6.Un = PM.6h - Un, levels= design)) 
+SR.6hUn <- topTags(SR.6hUn, n=NULL)
+SR.6hUn <- SR.6hUn$table
+colnames(SR.6hUn) <- paste(colnames(SR.6hUn), "6hUn", sep=".")
+
+SR.6hUn.up <- subset(SR.6hUn, SR.6hUn$logFC.6hUn > 0 & SR.6hUn$FDR.6hUn < 0.01)
+SR.6hUn.up <- rownames(SR.6hUn.up)
+write.table(SR.6hUn.up, "SR.6hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+SR.6hUn.down <- subset(SR.6hUn, SR.6hUn$logFC.6hUn < 0 & SR.6hUn$FDR.6hUn < 0.01)
+SR.6hUn.down <- rownames(SR.6hUn.down)
+write.table(SR.6hUn.down, "SR.6hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to unmated
+SR.24hUn <- glmLRT(SR.post, contrast = makeContrasts(PM24.Un = PM.24h - Un, levels= design)) 
+SR.24hUn <- topTags(SR.24hUn, n=NULL)
+SR.24hUn <- SR.24hUn$table
+colnames(SR.24hUn) <- paste(colnames(SR.24hUn), "24hUn", sep=".")
+
+SR.24hUn.up <- subset(SR.24hUn, SR.24hUn$logFC > 0 & SR.24hUn$FDR < 0.01)
+SR.24hUn.up <- rownames(SR.24hUn.up)
+write.table(SR.24hUn.up, "SR.24hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+SR.24hUn.down <- subset(SR.24hUn, SR.24hUn$logFC < 0 & SR.24hUn$FDR < 0.01)
+SR.24hUn.down <- rownames(SR.24hUn.down)
+write.table(SR.24hUn.down, "SR.24hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to 6h
+SR.24h6h <- glmLRT(SR.post, contrast = makeContrasts(PM24.PM6 = PM.24h - PM.6h, levels= design)) 
+SR.24h6h <- topTags(SR.24h6h, n=NULL)
+SR.24h6h <- SR.24h6h$table
+colnames(SR.24h6h) <- paste(colnames(SR.24h6h), "24h6h", sep=".")
+
+SR.24h6h.up <- subset(SR.24h6h, SR.24h6h$logFC.24h6h > 0 & SR.24h6h$FDR.24h6h < 0.01)
+SR.24h6h.up <- rownames(SR.24h6h.up)
+write.table(SR.24h6h.up, "SR.24h6h.up.txt", quote=F, row.names=F, col.names = F)
+
+SR.24h6h.down <- subset(SR.24h6h, SR.24h6h$logFC.24h6h < 0 & SR.24h6h$FDR.24h6h < 0.01)
+SR.24h6h.down <- rownames(SR.24h6h.down)
+write.table(SR.24h6h.down, "SR.24h6h.down.txt", quote=F, row.names=F, col.names = F)
+
+######################################################################################################
+
+#ST: 7000 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.ST
+write.table(cpmFRT.ST, "ST.background.txt", quote=F, row.names=F, col.names=F)
+
+FRT.keep.ST <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.ST <- FRT.keep.ST[,grep('ST', FRT.keep.ST$samples$tissue)]
+FRT.keep.norm.ST <- calcNormFactors(FRT.keep.ST, method="TMM")
+plotMDS(FRT.keep.norm.ST, col=rep(1:3, each=4))
+
+design <- model.matrix(~0 + FRT.keep.norm.ST$samples$run + FRT.keep.norm.ST$samples$time)
+row.names(design) <- colnames(FRT.keep.norm.ST)
+colnames(design) = c("run", "PM.24h", "PM.6h", "Un")
+
+FRT.keep.norm.ST <- estimateDisp(FRT.keep.norm.ST, design, robust=T)
+FRT.keep.norm.ST$common.dispersion
+plotBCV(FRT.keep.norm.ST)
+
+ST.post <- glmFit(FRT.keep.norm.ST, design)
+
+#6h compared to unmated
+ST.6hUn <- glmLRT(ST.post, contrast = makeContrasts(PM6.Un = PM.6h - Un, levels= design)) 
+ST.6hUn <- topTags(ST.6hUn, n=NULL)
+ST.6hUn <- ST.6hUn$table
+colnames(ST.6hUn) <- paste(colnames(ST.6hUn), "6hUn", sep=".")
+
+ST.6hUn.up <- subset(ST.6hUn, ST.6hUn$logFC.6hUn > 0 & ST.6hUn$FDR.6hUn < 0.01)
+ST.6hUn.up <- rownames(ST.6hUn.up)
+write.table(ST.6hUn.up, "ST.6hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+ST.6hUn.down <- subset(ST.6hUn, ST.6hUn$logFC.6hUn < 0 & ST.6hUn$FDR.6hUn < 0.01)
+ST.6hUn.down <- rownames(ST.6hUn.down)
+write.table(ST.6hUn.down, "ST.6hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to unmated
+ST.24hUn <- glmLRT(ST.post, contrast = makeContrasts(PM24.Un = PM.24h - Un, levels= design)) 
+ST.24hUn <- topTags(ST.24hUn, n=NULL)
+ST.24hUn <- ST.24hUn$table
+colnames(ST.24hUn) <- paste(colnames(ST.24hUn), "24hUn", sep=".")
+
+ST.24hUn.up <- subset(ST.24hUn, ST.24hUn$logFC > 0 & ST.24hUn$FDR < 0.01)
+ST.24hUn.up <- rownames(ST.24hUn.up)
+write.table(ST.24hUn.up, "ST.24hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+ST.24hUn.down <- subset(ST.24hUn, ST.24hUn$logFC < 0 & ST.24hUn$FDR < 0.01)
+ST.24hUn.down <- rownames(ST.24hUn.down)
+write.table(ST.24hUn.down, "ST.24hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to 6h
+ST.24h6h <- glmLRT(ST.post, contrast = makeContrasts(PM24.PM6 = PM.24h - PM.6h, levels= design)) 
+ST.24h6h <- topTags(ST.24h6h, n=NULL)
+ST.24h6h <- ST.24h6h$table
+colnames(ST.24h6h) <- paste(colnames(ST.24h6h), "24h6h", sep=".")
+
+ST.24h6h.up <- subset(ST.24h6h, ST.24h6h$logFC.24h6h > 0 & ST.24h6h$FDR.24h6h < 0.01)
+ST.24h6h.up <- rownames(ST.24h6h.up)
+write.table(ST.24h6h.up, "ST.24h6h.up.txt", quote=F, row.names=F, col.names = F)
+
+ST.24h6h.down <- subset(ST.24h6h, ST.24h6h$logFC.24h6h < 0 & ST.24h6h$FDR.24h6h < 0.01)
+ST.24h6h.down <- rownames(ST.24h6h.down)
+write.table(ST.24h6h.down, "ST.24h6h.down.txt", quote=F, row.names=F, col.names = F)
+
+######################################################################################################
+
+#PO: 6723 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.PO
+write.table(cpmFRT.PO, "PO.background.txt", quote=F, row.names=F, col.names=F)
+
+FRT.keep.PO <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.PO <- FRT.keep.PO[,grep('PO', FRT.keep.PO$samples$tissue)]
+FRT.keep.norm.PO <- calcNormFactors(FRT.keep.PO, method="TMM")
+plotMDS(FRT.keep.norm.PO, col=rep(1:3, each=4))
+
+design <- model.matrix(~0 + FRT.keep.norm.PO$samples$run + FRT.keep.norm.PO$samples$time)
+row.names(design) <- colnames(FRT.keep.norm.PO)
+colnames(design) = c("run", "PM.24h", "PM.6h", "Un")
+
+FRT.keep.norm.PO <- estimateDisp(FRT.keep.norm.PO, design, robust=T)
+FRT.keep.norm.PO$common.dispersion
+plotBCV(FRT.keep.norm.PO)
+
+PO.post <- glmFit(FRT.keep.norm.PO, design)
+
+#6h compared to unmated
+PO.6hUn <- glmLRT(PO.post, contrast = makeContrasts(PM6.Un = PM.6h - Un, levels= design)) 
+PO.6hUn <- topTags(PO.6hUn, n=NULL)
+PO.6hUn <- PO.6hUn$table
+colnames(PO.6hUn) <- paste(colnames(PO.6hUn), "6hUn", sep=".")
+
+PO.6hUn.up <- subset(PO.6hUn, PO.6hUn$logFC.6hUn > 0 & PO.6hUn$FDR.6hUn < 0.01)
+PO.6hUn.up <- rownames(PO.6hUn.up)
+write.table(PO.6hUn.up, "PO.6hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+PO.6hUn.down <- subset(PO.6hUn, PO.6hUn$logFC.6hUn < 0 & PO.6hUn$FDR.6hUn < 0.01)
+PO.6hUn.down <- rownames(PO.6hUn.down)
+write.table(PO.6hUn.down, "PO.6hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to unmated
+PO.24hUn <- glmLRT(PO.post, contrast = makeContrasts(PM24.Un = PM.24h - Un, levels= design)) 
+PO.24hUn <- topTags(PO.24hUn, n=NULL)
+PO.24hUn <- PO.24hUn$table
+colnames(PO.24hUn) <- paste(colnames(PO.24hUn), "24hUn", sep=".")
+
+PO.24hUn.up <- subset(PO.24hUn, PO.24hUn$logFC > 0 & PO.24hUn$FDR < 0.01)
+PO.24hUn.up <- rownames(PO.24hUn.up)
+write.table(PO.24hUn.up, "PO.24hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+PO.24hUn.down <- subset(PO.24hUn, PO.24hUn$logFC < 0 & PO.24hUn$FDR < 0.01)
+PO.24hUn.down <- rownames(PO.24hUn.down)
+write.table(PO.24hUn.down, "PO.24hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to 6h
+PO.24h6h <- glmLRT(PO.post, contrast = makeContrasts(PM24.PM6 = PM.24h - PM.6h, levels= design)) 
+PO.24h6h <- topTags(PO.24h6h, n=NULL)
+PO.24h6h <- PO.24h6h$table
+colnames(PO.24h6h) <- paste(colnames(PO.24h6h), "24h6h", sep=".")
+
+PO.24h6h.up <- subset(PO.24h6h, PO.24h6h$logFC.24h6h > 0 & PO.24h6h$FDR.24h6h < 0.01)
+PO.24h6h.up <- rownames(PO.24h6h.up)
+write.table(PO.24h6h.up, "PO.24h6h.up.txt", quote=F, row.names=F, col.names = F)
+
+PO.24h6h.down <- subset(PO.24h6h, PO.24h6h$logFC.24h6h < 0 & PO.24h6h$FDR.24h6h < 0.01)
+PO.24h6h.down <- rownames(PO.24h6h.down)
+write.table(PO.24h6h.down, "PO.24h6h.down.txt", quote=F, row.names=F, col.names = F)
+
+######################################################################################################
+
+#FB: 4787 genes expressed
+keep.exprs <- row.names(FRT) %in% cpmFRT.FB
+write.table(cpmFRT.FB, "FB.background.txt", quote=F, row.names=F, col.names=F)
+
+FRT.keep.FB <- FRT[keep.exprs,, keep.lib.sizes=FALSE]
+FRT.keep.FB <- FRT.keep.FB[,grep('FB', FRT.keep.FB$samples$tissue)]
+FRT.keep.norm.FB <- calcNormFactors(FRT.keep.FB, method="TMM")
+plotMDS(FRT.keep.norm.FB, col=rep(1:3, each=4))
+
+design <- model.matrix(~0 + FRT.keep.norm.FB$samples$run + FRT.keep.norm.FB$samples$time)
+row.names(design) <- colnames(FRT.keep.norm.FB)
+colnames(design) = c("run", "PM.24h", "PM.6h", "Un")
+
+FRT.keep.norm.FB <- estimateDisp(FRT.keep.norm.FB, design, robust=T)
+FRT.keep.norm.FB$common.dispersion
+plotBCV(FRT.keep.norm.FB)
+
+FB.post <- glmFit(FRT.keep.norm.FB, design)
+
+#6h compared to unmated
+FB.6hUn <- glmLRT(FB.post, contrast = makeContrasts(PM6.Un = PM.6h - Un, levels= design)) 
+FB.6hUn <- topTags(FB.6hUn, n=NULL)
+FB.6hUn <- FB.6hUn$table
+colnames(FB.6hUn) <- paste(colnames(FB.6hUn), "6hUn", sep=".")
+
+FB.6hUn.up <- subset(FB.6hUn, FB.6hUn$logFC.6hUn > 0 & FB.6hUn$FDR.6hUn < 0.01)
+FB.6hUn.up <- rownames(FB.6hUn.up)
+write.table(FB.6hUn.up, "FB.6hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+FB.6hUn.down <- subset(FB.6hUn, FB.6hUn$logFC.6hUn < 0 & FB.6hUn$FDR.6hUn < 0.01)
+FB.6hUn.down <- rownames(FB.6hUn.down)
+write.table(FB.6hUn.down, "FB.6hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to unmated
+FB.24hUn <- glmLRT(FB.post, contrast = makeContrasts(PM24.Un = PM.24h - Un, levels= design)) 
+FB.24hUn <- topTags(FB.24hUn, n=NULL)
+FB.24hUn <- FB.24hUn$table
+colnames(FB.24hUn) <- paste(colnames(FB.24hUn), "24hUn", sep=".")
+
+FB.24hUn.up <- subset(FB.24hUn, FB.24hUn$logFC > 0 & FB.24hUn$FDR < 0.01)
+FB.24hUn.up <- rownames(FB.24hUn.up)
+write.table(FB.24hUn.up, "FB.24hUn.up.txt", quote=F, row.names=F, col.names = F)
+
+FB.24hUn.down <- subset(FB.24hUn, FB.24hUn$logFC < 0 & FB.24hUn$FDR < 0.01)
+FB.24hUn.down <- rownames(FB.24hUn.down)
+write.table(FB.24hUn.down, "FB.24hUn.down.txt", quote=F, row.names=F, col.names = F)
+
+#24h compared to 6h
+FB.24h6h <- glmLRT(FB.post, contrast = makeContrasts(PM24.PM6 = PM.24h - PM.6h, levels= design)) 
+FB.24h6h <- topTags(FB.24h6h, n=NULL)
+FB.24h6h <- FB.24h6h$table
+colnames(FB.24h6h) <- paste(colnames(FB.24h6h), "24h6h", sep=".")
+
+FB.24h6h.up <- subset(FB.24h6h, FB.24h6h$logFC.24h6h > 0 & FB.24h6h$FDR.24h6h < 0.01)
+FB.24h6h.up <- rownames(FB.24h6h.up)
+write.table(FB.24h6h.up, "FB.24h6h.up.txt", quote=F, row.names=F, col.names = F)
+
+FB.24h6h.down <- subset(FB.24h6h, FB.24h6h$logFC.24h6h < 0 & FB.24h6h$FDR.24h6h < 0.01)
+FB.24h6h.down <- rownames(FB.24h6h.down)
+write.table(FB.24h6h.down, "FB.24h6h.down.txt", quote=F, row.names=F, col.names = F)
+
+######################################################################################################
+```
+
+Looking at overlaps in genes that are differentially expressed
+Greatest overlaps are among upregulated 6hr compared to unmated
+including 16 in all FRT tissues
+```{r}
+#overlap in those upregulated 6h compared to unmated
+listInput <- list(FB = FB.6hUn.up, BUR = BUR.6hUn.up, OVD = OVD.6hUn.up, SR = SR.6hUn.up, ST = ST.6hUn.up, PO = PO.6hUn.up)
+upset(fromList(listInput), order.by = "freq", nsets=6)
+
+listInput <- list(BUR = BUR.6hUn.up, OVD = OVD.6hUn.up, SR = SR.6hUn.up, ST = ST.6hUn.up, PO = PO.6hUn.up)
+upset(fromList(listInput), order.by = "freq", nsets=5) #excluding the FB
+
+Comp.6hUp <- fromList(listInput)
+write.table(subset(row.names(Comp.6hUp), Comp.6hUp$BUR == 1 & Comp.6hUp$OVD == 1 & Comp.6hUp$SR == 1 & Comp.6hUp$ST ==1 & Comp.6hUp$PO ==1), "All.6hUp.txt", quote=F, row.names=F, col.names = F)
+
+# what percent is shared with another tissue?
+tissueonlyde.6up <- data.frame(c("BUR", "OVD", "SR", "ST", "PO"),
+                               c(815, 40, 29, 46, 6),
+                               c(length(which(Comp.6hUp$BUR ==1)),length(which(Comp.6hUp$OVD ==1)),length(which(Comp.6hUp$SR ==1)),length(which(Comp.6hUp$ST ==1)),length(which(Comp.6hUp$PO ==1))))
+colnames(tissueonlyde.6up) <- c("tissue", "only", "all")
+tissueonlyde.6up$porp <- tissueonlyde.6up$only / tissueonlyde.6up$all
+1 - mean(tissueonlyde.6up$porp)
+st.err(tissueonlyde.6up$porp)
+
+#overlap in those downregulated 6h compared to unmated
+listInput <- list(BUR = BUR.6hUn.down, OVD = OVD.6hUn.down, SR = SR.6hUn.down, ST = ST.6hUn.down, PO = PO.6hUn.down)
+upset(fromList(listInput), order.by = "freq", nsets=6)
+
+comp.6down <- fromList(listInput)
+tissueonlyde.6down <- data.frame(c("BUR", "OVD", "SR", "ST", "PO"),
+                               c(942, 16, 33, 102, 9),
+                               c(length(which(comp.6down$BUR ==1)),length(which(comp.6down$OVD ==1)),length(which(comp.6down$SR ==1)),length(which(comp.6down$ST ==1)),length(which(comp.6down$PO ==1))))
+colnames(tissueonlyde.6down) <- c("tissue", "only", "all")
+tissueonlyde.6down$porp <- tissueonlyde.6down$only / tissueonlyde.6down$all
+1-mean(tissueonlyde.6down$porp)
+st.err(tissueonlyde.6down$porp)
+
+#overlap in those upregulated 24h compared to unmated
+listInput <- list(FB = FB.24hUn.up, BUR = BUR.24hUn.up, OVD = OVD.24hUn.up, SR = SR.24hUn.up, ST = ST.24hUn.up, PO = PO.24hUn.up)
+upset(fromList(listInput), order.by = "freq", nsets=6)
+
+#overlap in those downregulated 24h compared to unmated
+listInput <- list(FB = FB.24hUn.down, BUR = BUR.24hUn.down, OVD = OVD.24hUn.down, SR = SR.24hUn.down, ST = ST.24hUn.down, PO = PO.24hUn.down)
+upset(fromList(listInput), order.by = "freq", nsets=6)
+
+#overlap in those upregulated 24h compared to unmated
+listInput <- list(BUR = BUR.24h6h.up, OVD = OVD.24h6h.up, SR = SR.24h6h.up, ST = ST.24h6h.up, PO = PO.24h6h.up)
+upset(fromList(listInput), order.by = "freq", nsets=6)
+
+comp.24.6up <- fromList(listInput)
+tissueonlyde.24.6up <- data.frame(c("BUR", "OVD", "SR", "ST", "PO"),
+                               c(440, 25, 15, 80, 10),
+                               c(length(which(comp.24.6up$BUR ==1)),length(which(comp.24.6up$OVD ==1)),length(which(comp.24.6up$SR ==1)),length(which(comp.24.6up$ST ==1)),length(which(comp.24.6up$PO ==1))))
+colnames(tissueonlyde.24.6up) <- c("tissue", "only", "all")
+tissueonlyde.24.6up$porp <- tissueonlyde.24.6up$only / tissueonlyde.24.6up$all
+1-mean(tissueonlyde.24.6up$porp)
+st.err(tissueonlyde.24.6up$porp)
+
+listInput <- list(BUR = BUR.24h6h.down, OVD = OVD.24h6h.down, SR = SR.24h6h.down, ST = ST.24h6h.down, PO = PO.24h6h.down)
+upset(fromList(listInput), order.by = "freq", nsets=6)
+
+comp.24.6down <- fromList(listInput)
+tissueonlyde.24.6down <- data.frame(c("BUR", "OVD", "SR", "ST", "PO"),
+                               c(529, 22, 20, 51, 14),
+                               c(length(which(comp.24.6down$BUR ==1)),length(which(comp.24.6down$OVD ==1)),length(which(comp.24.6down$SR ==1)),length(which(comp.24.6down$ST ==1)),length(which(comp.24.6down$PO ==1))))
+colnames(tissueonlyde.24.6down) <- c("tissue", "only", "all")
+tissueonlyde.24.6down$porp <- tissueonlyde.24.6down$only / tissueonlyde.24.6down$all
+1-mean(tissueonlyde.24.6down$porp)
+st.err(tissueonlyde.24.6down$porp)
+
+```
+
+
+visualization of differentially expressed genes at 6h postmating (compared to unmated)
+```{r}
+#6h compared to unmated
+BUR.6hUn$tissue <- "BUR"
+OVD.6hUn$tissue <- "OVD"
+SR.6hUn$tissue <- "SR"
+ST.6hUn$tissue <- "ST"
+PO.6hUn$tissue <- "PO"
+FB.6hUn$tissue <- "FB"
+
+BUR.6hUn$fbgn <- row.names(BUR.6hUn)
+OVD.6hUn$fbgn <- rownames(OVD.6hUn)
+SR.6hUn$fbgn <- rownames(SR.6hUn)
+ST.6hUn$fbgn <- rownames(ST.6hUn)
+PO.6hUn$fbgn <- rownames(PO.6hUn)
+FB.6hUn$fbgn <- rownames(FB.6hUn)
+
+Tissue.6hUn <- rbind(BUR.6hUn, OVD.6hUn, SR.6hUn, ST.6hUn, PO.6hUn, FB.6hUn)
+Tissue.6hUn$tissue <- factor(Tissue.6hUn$tissue, levels=c("BUR", "FB", "SR", "ST", "OVD", "PO"))
+
+#tiff('6hrDE.Fig5A.tiff', units="in", width=7, height=7, res=300)
+ggplot(data = Tissue.6hUn, aes(y = logFC.6hUn, x = tissue, fill = tissue)) +
+geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .8, trim = T) +
+geom_point(aes(y = logFC.6hUn, x = tissue), data=subset(Tissue.6hUn, Tissue.6hUn$FDR > 0.01), position = position_jitter(width = .15), size = .5, alpha = 0.8, pch = 1, color = "grey") +
+geom_point(aes(y = logFC.6hUn, x = tissue), data=subset(Tissue.6hUn, Tissue.6hUn$FDR < 0.01), position = position_jitter(width = .15), size = .5, alpha = 0.8, pch = 1, color = "red") +
+geom_boxplot(width = .1, guides = FALSE, outlier.shape = NA, alpha = 0.5) +
+expand_limits(x = 5.25) +
+guides(fill = FALSE) +
+guides(color = FALSE) +
+scale_fill_manual(values=c(bur.col,"pink", sr.col, st.col, ovd.col, po.col)) +
+ylab("Log2 FC Unmated to 6hrs") +
+xlab("Tissue")+
+theme_bw() +
+raincloud_theme
+#dev.off()
+```
+
+visualization of differentially expressed genes at 24h postmating
+```{r}
+#24h compared to unmated
+BUR.24hUn$fbgn <- row.names(BUR.24hUn)
+OVD.24hUn$fbgn <- rownames(OVD.24hUn)
+SR.24hUn$fbgn <- rownames(SR.24hUn)
+ST.24hUn$fbgn <- rownames(ST.24hUn)
+PO.24hUn$fbgn <- rownames(PO.24hUn)
+FB.24hUn$fbgn <- rownames(FB.24hUn)
+
+BUR.24hUn$tissue <- "BUR"
+OVD.24hUn$tissue <- "OVD"
+SR.24hUn$tissue <- "SR"
+ST.24hUn$tissue <- "ST"
+PO.24hUn$tissue <- "PO"
+FB.24hUn$tissue <- "FB"
+
+Tissue.24hUn <- rbind(BUR.24hUn, OVD.24hUn, SR.24hUn, ST.24hUn, PO.24hUn, FB.24hUn)
+Tissue.24hUn$tissue <- factor(Tissue.24hUn$tissue, levels=c("BUR", "FB", "ST", "OVD", "PO", "SR"))
+
+#tiff('24hrDEFig5B.tiff', units="in", width=7, height=7, res=300)
+ggplot(data = Tissue.24hUn, aes(y = logFC.24hUn, x = tissue, fill = tissue)) +
+geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .8, trim = T) +
+geom_point(aes(y = logFC.24hUn, x = tissue), data=subset(Tissue.24hUn, Tissue.24hUn$FDR > 0.01), position = position_jitter(width = .15), size = .5, alpha = 0.8, pch = 1, color = "grey") +
+geom_point(aes(y = logFC.24hUn, x = tissue), data=subset(Tissue.24hUn, Tissue.24hUn$FDR < 0.01), position = position_jitter(width = .15), size = .5, alpha = 0.8, pch = 1, color = "red") +
+geom_boxplot(width = .1, guides = FALSE, outlier.shape = NA, alpha = 0.5) +
+expand_limits(x = 5.25) +
+guides(fill = FALSE) +
+guides(color = FALSE) +
+scale_fill_manual(values=c(bur.col, "pink", st.col, ovd.col, po.col, sr.col)) +
+ylab("Log2 FC Unmated to 24hrs") +
+xlab("Tissue")+
+theme_bw() +
+raincloud_theme
+#dev.off()
+```
+
+
+Number of differentially expressed genes and test whether there are significant differences between them
+```{r}
+Postmating.num <- data.frame(
+    "Tissue" = c("BUR", "OVD", "SR", "ST", "PO", "FB"),
+    "6hUn.up" = c(length(BUR.6hUn.up), length(OVD.6hUn.up), length(SR.6hUn.up), length(ST.6hUn.up), length(PO.6hUn.up), length(FB.6hUn.up)),
+    "6hUn.down" = c(length(BUR.6hUn.down), length(OVD.6hUn.down), length(SR.6hUn.down), length(ST.6hUn.down), length(PO.6hUn.down), length(FB.6hUn.down)),
+    "24hUn.up" = c(length(BUR.24hUn.up), length(OVD.24hUn.up), length(SR.24hUn.up), length(ST.24hUn.up), length(PO.24hUn.up), length(FB.24hUn.up)),
+    "24hUn.down" = c(length(BUR.24hUn.down), length(OVD.24hUn.down), length(SR.24hUn.down), length(ST.24hUn.down), length(PO.24hUn.down), length(FB.24hUn.down)),
+    "24h6h.up" = c(length(BUR.24h6h.up), length(OVD.24h6h.up), length(SR.24h6h.up), length(ST.24h6h.up), length(PO.24h6h.up), length(FB.24h6h.up)),
+    "24h6h.down" = c(length(BUR.24h6h.down), length(OVD.24h6h.down), length(SR.24h6h.down), length(ST.24h6h.down), length(PO.24h6h.down), length(FB.24h6h.down)),
+    "N" = c(length(cpmFRT.BUR), length(cpmFRT.OVD), length(cpmFRT.SR), length(cpmFRT.ST), length(cpmFRT.PO), length(cpmFRT.FB))
+)
+
+Postmating.num$X6h.all <- Postmating.num$X6hUn.up + Postmating.num$X6hUn.down
+Postmating.num$X24h.all <- Postmating.num$X24hUn.up + Postmating.num$X24hUn.down
+Postmating.num$X6h.Higher <- Postmating.num$X6h.all / Postmating.num$X24h.all
+Postmating.num$X6.all.not <- Postmating.num$N - Postmating.num$X6h.all
+Postmating.num$X24.all.not <- Postmating.num$N - Postmating.num$X24h.all
+Postmating.num$X6.prop <- Postmating.num$X6h.all / Postmating.num$N
+Postmating.num$X24.prop <- Postmating.num$X24h.all / Postmating.num$N
+
+mean(Postmating.num$X6hUn.up)
+st.err(Postmating.num$X6hUn.up)
+
+mean(Postmating.num$X6hUn.down)
+st.err(Postmating.num$X6hUn.down)
+
+mean(Postmating.num$X24hUn.up)
+st.err(Postmating.num$X24hUn.up)
+
+mean(Postmating.num$X24hUn.down)
+st.err(Postmating.num$X24hUn.down)
+
+#Are there significantly different numbers of genes differentially expressed across tissues from Un to 6?
+chisq.test(Postmating.num[,c(9,12)])
+chisq.test(Postmating.num[,c(9,12)])$p.value
+
+#Yep!
+
+Postmating.num[1,14] / Postmating.num[6,14] #2.14
+
+# From Un to 24?
+chisq.test(Postmating.num[,c(10,13)])
+chisq.test(Postmating.num[,c(10,13)])$p.value
+#Yep!
+
+Postmating.num[1,15] / Postmating.num[6,15] #1.01
+
+
+#Are there significantly different numbers of genes differentially expressed at Un to 6 vs. Un to 24?
+Postmating.comp <- t(Postmating.num[,c(8,9,10)])
+colnames(Postmating.comp) <- c("BUR", "OVD", "SR", "ST", "PO", "FB")
+Postmating.comp <- rbind(Postmating.comp, Postmating.comp[1,] - (Postmating.comp[2,] + Postmating.comp[3,]))
+Postmating.comp <- Postmating.comp[-1,]
+
+#Are there significant difference in the number of genes differentially expressed at 6hrs and 24hrs postmating? 
+chisq.test(Postmating.comp[2:3,1]) # BUR
+chisq.test(Postmating.comp[2:3,2]) # OVD
+chisq.test(Postmating.comp[2:3,3]) # SR
+chisq.test(Postmating.comp[2:3,4]) # ST
+chisq.test(Postmating.comp[2:3,5]) # PO
+chisq.test(Postmating.comp[2:3,6]) # FB
+#Yes! for all tissues!
+
+
+#Are there signficantly more genes upregulated than downregulated at 6hrs postmating?
+postmating.6 <- t(Postmating.num[,c(2,3)])
+colnames(postmating.6) <- c("BUR", "OVD", "SR", "ST", "PO", "FB")
+chisq.test(postmating.6[,1]) # The BUR is not significant
+chisq.test(postmating.6[,2]) # OVD
+chisq.test(postmating.6[,3]) # SR
+chisq.test(postmating.6[,4]) # The ST is not significant
+chisq.test(postmating.6[,5]) # PO
+chisq.test(postmating.6[,6]) # FB
+
+#Are there signficantly more genes upregulated than downregulated at 24hrs postmating?
+postmating.24 <- t(Postmating.num[,c(4,5)])
+colnames(postmating.24) <- c("BUR", "OVD", "SR", "ST", "PO", "FB")
+chisq.test(postmating.24[,1]) # BUR
+chisq.test(postmating.24[,2]) # OVD
+chisq.test(postmating.24[,3]) # SR
+chisq.test(postmating.24[,4]) # ST
+chisq.test(postmating.24[,5]) # The PO is not significant
+chisq.test(postmating.24[,6]) # FB
+```
+
+
+Correlation between logFC from unmated to 6h and then 6h to 24h within a tissue
+```{r}
+#prep 24h samples
+BUR.24h6h$fbgn <- row.names(BUR.24h6h)
+OVD.24h6h$fbgn <- rownames(OVD.24h6h)
+SR.24h6h$fbgn <- rownames(SR.24h6h)
+ST.24h6h$fbgn <- rownames(ST.24h6h)
+PO.24h6h$fbgn <- rownames(PO.24h6h)
+FB.24h6h$fbgn <- rownames(FB.24h6h)
+
+BUR.24h6h$tissue <- "BUR"
+OVD.24h6h$tissue <- "OVD"
+SR.24h6h$tissue <- "SR"
+ST.24h6h$tissue <- "ST"
+PO.24h6h$tissue <- "PO"
+FB.24h6h$tissue <- "FB"
+
+Tissue.24h6h <- rbind(BUR.24h6h, OVD.24h6h, SR.24h6h, ST.24h6h, PO.24h6h, FB.24h6h)
+Tissue.24h6h$tissue <- factor(Tissue.24h6h$tissue, levels=c("BUR", "OVD", "SR", "ST", "PO", "FB"))
+
+
+Tissue.post <- full_join(Tissue.6hUn, Tissue.24h6h)
+Tissue.post <- full_join(Tissue.post, Tissue.24hUn)
+Tissue.post$tissue <- factor(Tissue.post$tissue, levels=c("BUR", "OVD", "PO", "SR", "ST", "FB"))
+
+#tiff('PostmatingCorrelation.Fig5C.tiff', units="in", width=10, height=2.5, res=300)
+ggplot(data=Tissue.post, aes(x=logFC.6hUn, y=logFC.24h6h, col=tissue))+
+geom_point(data=subset(Tissue.post, Tissue.post$FDR.6hUn > 0.05 & Tissue.post$FDR.24hUn > 0.05), size = .2, alpha = 0.65, pch = 1, color = "grey") +
+geom_point(data=subset(Tissue.post, (Tissue.post$FDR.6hUn < 0.05 & Tissue.post$FDR.24hUn > 0.05) | (Tissue.post$FDR.24hUn < 0.05 & Tissue.post$FDR.6hUn > 0.05)), size = .2, alpha = 0.65, pch = 1, color = "black") +
+  geom_point(data=subset(Tissue.post, Tissue.post$FDR.6hUn < 0.05 | Tissue.post$FDR.24hUn < 0.05), size = .2, alpha = 0.65, pch = 1, color = "red") +
+#geom_point(data=subset(Tissue.post, Tissue.post$FDR.6hUn < 0.05 & Tissue.post$FDR.24hUn < 0.05), size = .2, alpha = 0.65, pch = 1, color = "red") +
+geom_smooth(method=lm, formula=y~x, se=T) +
+xlab("Log 2FC Unmated to 6h") +
+ylab("Log2 FC 6h to 24h") +
+facet_wrap(~tissue, strip.position = "bottom", ncol = 6) + 
+scale_color_manual(values=c(bur.col, ovd.col, po.col, sr.col, st.col, "pink"))+
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+theme_classic()
+#dev.off()
+
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "BUR")))$r.squared, 2)
+lmp(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "BUR")))
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "OVD")))$r.squared, 2)
+lmp(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "OVD")))
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "SR")))$r.squared, 2)
+lmp(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "SR")))
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "ST")))$r.squared, 2)
+lmp(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "ST")))
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "PO")))$r.squared, 2)
+lmp(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "PO")))
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "FB")))$r.squared, 2)
+lmp(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "FB")))
+
+mean( c(round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "BUR")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "OVD")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "SR")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "ST")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "PO")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "FB")))$r.squared, 2))) #0.48
+
+st.err( c(round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "BUR")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "OVD")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "SR")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "ST")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "PO")))$r.squared, 2),
+round(summary(lm(logFC.6hUn ~ logFC.24h6h, data=subset(Tissue.post, Tissue.post$tissue == "FB")))$r.squared, 2))) #0.06
+```
+
+
+
+Creating supp table for DE analysis
+```{r}
+colnames(BUR.6hUn) <- paste("BUR", colnames(BUR.6hUn), sep = "_")
+colnames(OVD.6hUn) <- paste("OVD", colnames(OVD.6hUn), sep = "_")
+colnames(SR.6hUn) <- paste("SR", colnames(SR.6hUn), sep = "_")
+colnames(ST.6hUn) <- paste("ST", colnames(ST.6hUn), sep = "_")
+colnames(PO.6hUn) <- paste("PO", colnames(PO.6hUn), sep = "_")
+colnames(FB.6hUn) <- paste("FB", colnames(FB.6hUn), sep = "_")
+
+colnames(BUR.24hUn) <- paste("BUR", colnames(BUR.24hUn), sep = "_")
+colnames(OVD.24hUn) <- paste("OVD", colnames(OVD.24hUn), sep = "_")
+colnames(SR.24hUn) <- paste("SR", colnames(SR.24hUn), sep = "_")
+colnames(ST.24hUn) <- paste("ST", colnames(ST.24hUn), sep = "_")
+colnames(PO.24hUn) <- paste("PO", colnames(PO.24hUn), sep = "_")
+colnames(FB.24hUn) <- paste("FB", colnames(FB.24hUn), sep = "_")
+
+colnames(BUR.24h6h) <- paste("BUR", colnames(BUR.24h6h), sep = "_")
+colnames(OVD.24h6h) <- paste("OVD", colnames(OVD.24h6h), sep = "_")
+colnames(SR.24h6h) <- paste("SR", colnames(SR.24h6h), sep = "_")
+colnames(ST.24h6h) <- paste("ST", colnames(ST.24h6h), sep = "_")
+colnames(PO.24h6h) <- paste("PO", colnames(PO.24h6h), sep = "_")
+colnames(FB.24h6h) <- paste("FB", colnames(FB.24h6h), sep = "_")
+
+BUR.6hUn$fbgn <- row.names(BUR.6hUn)
+OVD.6hUn$fbgn <- rownames(OVD.6hUn)
+SR.6hUn$fbgn <- rownames(SR.6hUn)
+ST.6hUn$fbgn <- rownames(ST.6hUn)
+PO.6hUn$fbgn <- rownames(PO.6hUn)
+FB.6hUn$fbgn <- rownames(FB.6hUn)
+
+BUR.24hUn$fbgn <- row.names(BUR.24hUn)
+OVD.24hUn$fbgn <- rownames(OVD.24hUn)
+SR.24hUn$fbgn <- rownames(SR.24hUn)
+ST.24hUn$fbgn <- rownames(ST.24hUn)
+PO.24hUn$fbgn <- rownames(PO.24hUn)
+FB.24hUn$fbgn <- rownames(FB.24hUn)
+
+BUR.24h6h$fbgn <- row.names(BUR.24h6h)
+OVD.24h6h$fbgn <- rownames(OVD.24h6h)
+SR.24h6h$fbgn <- rownames(SR.24h6h)
+ST.24h6h$fbgn <- rownames(ST.24h6h)
+PO.24h6h$fbgn <- rownames(PO.24h6h)
+FB.24h6h$fbgn <- rownames(FB.24h6h)
+
+BUR.DE <- join_all(list(BUR.6hUn, BUR.24hUn, BUR.24h6h), by='fbgn', type='full')
+OVD.DE <- join_all(list(OVD.6hUn, OVD.24hUn, OVD.24h6h), by='fbgn', type='full')
+SR.DE <- join_all(list(SR.6hUn, SR.24hUn, SR.24h6h), by='fbgn', type='full')
+ST.DE <- join_all(list(ST.6hUn, ST.24hUn, ST.24h6h), by='fbgn', type='full')
+PO.DE <- join_all(list(PO.6hUn, PO.24hUn, PO.24h6h), by='fbgn', type='full')
+FB.DE <- join_all(list(FB.6hUn, FB.24hUn, FB.24h6h), by='fbgn', type='full')
+
+```
+
+Separating post-mating into transient and long-term
+```{r}
+BUR.DE$DE.6hUn <- ifelse (BUR.DE$fbgn %in% BUR.6hUn.up, "Up", ifelse (BUR.DE$fbgn %in% BUR.6hUn.down, "Down", "Not"))
+BUR.DE$DE.24hUn <- ifelse (BUR.DE$fbgn %in% BUR.24hUn.up, "Up", ifelse (BUR.DE$fbgn %in% BUR.24hUn.down, "Down", "Not"))
+
+length(which(BUR.DE$DE.6hUn == "Up" & BUR.DE$DE.24hUn == "Not")) #1017: transient.up
+length(which(BUR.DE$DE.6hUn == "Up" & BUR.DE$DE.24hUn == "Up")) #96: long.up
+length(which(BUR.DE$DE.6hUn == "Up" & BUR.DE$DE.24hUn == "Down")) #0: transient.up
+length(which(BUR.DE$DE.6hUn == "Down" & BUR.DE$DE.24hUn == "Not")) #1086: transient.down
+length(which(BUR.DE$DE.6hUn == "Down" & BUR.DE$DE.24hUn == "Up")) #1: transient.down
+length(which(BUR.DE$DE.6hUn == "Down" & BUR.DE$DE.24hUn == "Down")) #19: long.down
+length(which(BUR.DE$DE.6hUn == "Not" & BUR.DE$DE.24hUn == "Not")) #4672: not DE
+length(which(BUR.DE$DE.6hUn == "Not" & BUR.DE$DE.24hUn == "Up")) #23: long.up
+length(which(BUR.DE$DE.6hUn == "Not" & BUR.DE$DE.24hUn == "Down")) #6: long.down
+
+
+BUR.DE$post.pattern <- ifelse(BUR.DE$DE.6hUn == "Up" & BUR.DE$DE.24hUn == "Not", "transient.up",
+                       ifelse(BUR.DE$DE.6hUn == "Up" & BUR.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(BUR.DE$DE.6hUn == "Up" & BUR.DE$DE.24hUn == "Down", "transient.up",
+                       ifelse(BUR.DE$DE.6hUn == "Down" & BUR.DE$DE.24hUn == "Not", "transient.down",
+                       ifelse(BUR.DE$DE.6hUn == "Down" & BUR.DE$DE.24hUn == "Up", "transient.down",
+                       ifelse(BUR.DE$DE.6hUn == "Down" & BUR.DE$DE.24hUn == "Down", "long.down",
+                       ifelse(BUR.DE$DE.6hUn == "Not" & BUR.DE$DE.24hUn == "Not", "not.DE",
+                       ifelse(BUR.DE$DE.6hUn == "Not" & BUR.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(BUR.DE$DE.6hUn == "Not" & BUR.DE$DE.24hUn == "Down", "long.down", "X"
+                       )))))))))
+
+BUR.transient.up <- subset(BUR.DE$fbgn, BUR.DE$post.pattern == "transient.up")
+write.table(BUR.transient.up, "BUR.transient.up.txt", quote=F, row.names=F, col.names = F)
+
+BUR.transient.down <- subset(BUR.DE$fbgn, BUR.DE$post.pattern == "transient.down")
+write.table(BUR.transient.down, "BUR.transient.down.txt", quote=F, row.names=F, col.names = F)
+
+BUR.long.up <- subset(BUR.DE$fbgn, BUR.DE$post.pattern == "long.up")
+write.table(BUR.long.up, "BUR.long.up.txt", quote=F, row.names=F, col.names = F)
+
+BUR.long.down <- subset(BUR.DE$fbgn, BUR.DE$post.pattern == "long.down")
+write.table(BUR.long.down, "BUR.long.down.txt", quote=F, row.names=F, col.names = F)
+
+####################################################################################################
+OVD.DE$DE.6hUn <- ifelse (OVD.DE$fbgn %in% OVD.6hUn.up, "Up", ifelse (OVD.DE$fbgn %in% OVD.6hUn.down, "Down", "Not"))
+OVD.DE$DE.24hUn <- ifelse (OVD.DE$fbgn %in% OVD.24hUn.up, "Up", ifelse (OVD.DE$fbgn %in% OVD.24hUn.down, "Down", "Not"))
+
+length(which(OVD.DE$DE.6hUn == "Up" & OVD.DE$DE.24hUn == "Not")) #164: transient.up
+length(which(OVD.DE$DE.6hUn == "Up" & OVD.DE$DE.24hUn == "Up")) #47: long.up
+length(which(OVD.DE$DE.6hUn == "Up" & OVD.DE$DE.24hUn == "Down")) #0: transient.up
+length(which(OVD.DE$DE.6hUn == "Down" & OVD.DE$DE.24hUn == "Not")) #75: transient.down
+length(which(OVD.DE$DE.6hUn == "Down" & OVD.DE$DE.24hUn == "Up")) #0: transient.down
+length(which(OVD.DE$DE.6hUn == "Down" & OVD.DE$DE.24hUn == "Down")) #3: long.down
+length(which(OVD.DE$DE.6hUn == "Not" & OVD.DE$DE.24hUn == "Not")) #7327: not DE
+length(which(OVD.DE$DE.6hUn == "Not" & OVD.DE$DE.24hUn == "Up")) #16: long.up
+length(which(OVD.DE$DE.6hUn == "Not" & OVD.DE$DE.24hUn == "Down")) #12: long.down
+
+
+OVD.DE$post.pattern <- ifelse(OVD.DE$DE.6hUn == "Up" & OVD.DE$DE.24hUn == "Not", "transient.up",
+                       ifelse(OVD.DE$DE.6hUn == "Up" & OVD.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(OVD.DE$DE.6hUn == "Up" & OVD.DE$DE.24hUn == "Down", "transient.up",
+                       ifelse(OVD.DE$DE.6hUn == "Down" & OVD.DE$DE.24hUn == "Not", "transient.down",
+                       ifelse(OVD.DE$DE.6hUn == "Down" & OVD.DE$DE.24hUn == "Up", "transient.down",
+                       ifelse(OVD.DE$DE.6hUn == "Down" & OVD.DE$DE.24hUn == "Down", "long.down",
+                       ifelse(OVD.DE$DE.6hUn == "Not" & OVD.DE$DE.24hUn == "Not", "not.DE",
+                       ifelse(OVD.DE$DE.6hUn == "Not" & OVD.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(OVD.DE$DE.6hUn == "Not" & OVD.DE$DE.24hUn == "Down", "long.down", "X"
+                       )))))))))
+
+OVD.transient.up <- subset(OVD.DE$fbgn, OVD.DE$post.pattern == "transient.up")
+write.table(OVD.transient.up, "OVD.transient.up.txt", quote=F, row.names=F, col.names = F)
+
+OVD.transient.down <- subset(OVD.DE$fbgn, OVD.DE$post.pattern == "transient.down")
+write.table(OVD.transient.down, "OVD.transient.down.txt", quote=F, row.names=F, col.names = F)
+
+OVD.long.up <- subset(OVD.DE$fbgn, OVD.DE$post.pattern == "long.up")
+write.table(OVD.long.up, "OVD.long.up.txt", quote=F, row.names=F, col.names = F)
+
+OVD.long.down <- subset(OVD.DE$fbgn, OVD.DE$post.pattern == "long.down")
+write.table(OVD.long.down, "OVD.long.down.txt", quote=F, row.names=F, col.names = F)
+
+####################################################################################################
+SR.DE$DE.6hUn <- ifelse (SR.DE$fbgn %in% SR.6hUn.up, "Up", ifelse (SR.DE$fbgn %in% SR.6hUn.down, "Down", "Not"))
+SR.DE$DE.24hUn <- ifelse (SR.DE$fbgn %in% SR.24hUn.up, "Up", ifelse (SR.DE$fbgn %in% SR.24hUn.down, "Down", "Not"))
+
+length(which(SR.DE$DE.6hUn == "Up" & SR.DE$DE.24hUn == "Not")) #202: transient.up
+length(which(SR.DE$DE.6hUn == "Up" & SR.DE$DE.24hUn == "Up")) #21: long.up
+length(which(SR.DE$DE.6hUn == "Up" & SR.DE$DE.24hUn == "Down")) #0: transient.up
+length(which(SR.DE$DE.6hUn == "Down" & SR.DE$DE.24hUn == "Not")) #114: transient.down
+length(which(SR.DE$DE.6hUn == "Down" & SR.DE$DE.24hUn == "Up")) #0: transient.down
+length(which(SR.DE$DE.6hUn == "Down" & SR.DE$DE.24hUn == "Down")) #2: long.down
+length(which(SR.DE$DE.6hUn == "Not" & SR.DE$DE.24hUn == "Not")) #7399: not DE
+length(which(SR.DE$DE.6hUn == "Not" & SR.DE$DE.24hUn == "Up")) #10: long.up
+length(which(SR.DE$DE.6hUn == "Not" & SR.DE$DE.24hUn == "Down")) #0: long.down
+
+
+SR.DE$post.pattern <- ifelse(SR.DE$DE.6hUn == "Up" & SR.DE$DE.24hUn == "Not", "transient.up",
+                       ifelse(SR.DE$DE.6hUn == "Up" & SR.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(SR.DE$DE.6hUn == "Up" & SR.DE$DE.24hUn == "Down", "transient.up",
+                       ifelse(SR.DE$DE.6hUn == "Down" & SR.DE$DE.24hUn == "Not", "transient.down",
+                       ifelse(SR.DE$DE.6hUn == "Down" & SR.DE$DE.24hUn == "Up", "transient.down",
+                       ifelse(SR.DE$DE.6hUn == "Down" & SR.DE$DE.24hUn == "Down", "long.down",
+                       ifelse(SR.DE$DE.6hUn == "Not" & SR.DE$DE.24hUn == "Not", "not.DE",
+                       ifelse(SR.DE$DE.6hUn == "Not" & SR.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(SR.DE$DE.6hUn == "Not" & SR.DE$DE.24hUn == "Down", "long.down", "X"
+                       )))))))))
+
+SR.transient.up <- subset(SR.DE$fbgn, SR.DE$post.pattern == "transient.up")
+write.table(SR.transient.up, "SR.transient.up.txt", quote=F, row.names=F, col.names = F)
+
+SR.transient.down <- subset(SR.DE$fbgn, SR.DE$post.pattern == "transient.down")
+write.table(SR.transient.down, "SR.transient.down.txt", quote=F, row.names=F, col.names = F)
+
+SR.long.up <- subset(SR.DE$fbgn, SR.DE$post.pattern == "long.up")
+write.table(SR.long.up, "SR.long.up.txt", quote=F, row.names=F, col.names = F)
+
+SR.long.down <- subset(SR.DE$fbgn, SR.DE$post.pattern == "long.down")
+write.table(SR.long.down, "SR.long.down.txt", quote=F, row.names=F, col.names = F)
+
+####################################################################################################
+ST.DE$DE.6hUn <- ifelse (ST.DE$fbgn %in% ST.6hUn.up, "Up", ifelse (ST.DE$fbgn %in% ST.6hUn.down, "Down", "Not"))
+ST.DE$DE.24hUn <- ifelse (ST.DE$fbgn %in% ST.24hUn.up, "Up", ifelse (ST.DE$fbgn %in% ST.24hUn.down, "Down", "Not"))
+
+length(which(ST.DE$DE.6hUn == "Up" & ST.DE$DE.24hUn == "Not")) #113: transient.up
+length(which(ST.DE$DE.6hUn == "Up" & ST.DE$DE.24hUn == "Up")) #30: long.up
+length(which(ST.DE$DE.6hUn == "Up" & ST.DE$DE.24hUn == "Down")) #0: transient.up
+length(which(ST.DE$DE.6hUn == "Down" & ST.DE$DE.24hUn == "Not")) #149: transient.down
+length(which(ST.DE$DE.6hUn == "Down" & ST.DE$DE.24hUn == "Up")) #1: transient.down
+length(which(ST.DE$DE.6hUn == "Down" & ST.DE$DE.24hUn == "Down")) #23: long.down
+length(which(ST.DE$DE.6hUn == "Not" & ST.DE$DE.24hUn == "Not")) #6639: not DE
+length(which(ST.DE$DE.6hUn == "Not" & ST.DE$DE.24hUn == "Up")) #32: long.up
+length(which(ST.DE$DE.6hUn == "Not" & ST.DE$DE.24hUn == "Down")) #13: long.down
+
+
+ST.DE$post.pattern <- ifelse(ST.DE$DE.6hUn == "Up" & ST.DE$DE.24hUn == "Not", "transient.up",
+                       ifelse(ST.DE$DE.6hUn == "Up" & ST.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(ST.DE$DE.6hUn == "Up" & ST.DE$DE.24hUn == "Down", "transient.up",
+                       ifelse(ST.DE$DE.6hUn == "Down" & ST.DE$DE.24hUn == "Not", "transient.down",
+                       ifelse(ST.DE$DE.6hUn == "Down" & ST.DE$DE.24hUn == "Up", "transient.down",
+                       ifelse(ST.DE$DE.6hUn == "Down" & ST.DE$DE.24hUn == "Down", "long.down",
+                       ifelse(ST.DE$DE.6hUn == "Not" & ST.DE$DE.24hUn == "Not", "not.DE",
+                       ifelse(ST.DE$DE.6hUn == "Not" & ST.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(ST.DE$DE.6hUn == "Not" & ST.DE$DE.24hUn == "Down", "long.down", "X"
+                       )))))))))
+
+ST.transient.up <- subset(ST.DE$fbgn, ST.DE$post.pattern == "transient.up")
+write.table(ST.transient.up, "ST.transient.up.txt", quote=F, row.names=F, col.names = F)
+
+ST.transient.down <- subset(ST.DE$fbgn, ST.DE$post.pattern == "transient.down")
+write.table(ST.transient.down, "ST.transient.down.txt", quote=F, row.names=F, col.names = F)
+
+ST.long.up <- subset(ST.DE$fbgn, ST.DE$post.pattern == "long.up")
+write.table(ST.long.up, "ST.long.up.txt", quote=F, row.names=F, col.names = F)
+
+ST.long.down <- subset(ST.DE$fbgn, ST.DE$post.pattern == "long.down")
+write.table(ST.long.down, "ST.long.down.txt", quote=F, row.names=F, col.names = F)
+
+####################################################################################################
+PO.DE$DE.6hUn <- ifelse (PO.DE$fbgn %in% PO.6hUn.up, "Up", ifelse (PO.DE$fbgn %in% PO.6hUn.down, "Down", "Not"))
+PO.DE$DE.24hUn <- ifelse (PO.DE$fbgn %in% PO.24hUn.up, "Up", ifelse (PO.DE$fbgn %in% PO.24hUn.down, "Down", "Not"))
+
+length(which(PO.DE$DE.6hUn == "Up" & PO.DE$DE.24hUn == "Not")) #54: transient.up
+length(which(PO.DE$DE.6hUn == "Up" & PO.DE$DE.24hUn == "Up")) #10: long.up
+length(which(PO.DE$DE.6hUn == "Up" & PO.DE$DE.24hUn == "Down")) #0: transient.up
+length(which(PO.DE$DE.6hUn == "Down" & PO.DE$DE.24hUn == "Not")) #13: transient.down
+length(which(PO.DE$DE.6hUn == "Down" & PO.DE$DE.24hUn == "Up")) #0: transient.down
+length(which(PO.DE$DE.6hUn == "Down" & PO.DE$DE.24hUn == "Down")) #5: long.down
+length(which(PO.DE$DE.6hUn == "Not" & PO.DE$DE.24hUn == "Not")) #6601: not DE
+length(which(PO.DE$DE.6hUn == "Not" & PO.DE$DE.24hUn == "Up")) #23: long.up
+length(which(PO.DE$DE.6hUn == "Not" & PO.DE$DE.24hUn == "Down")) #17: long.down
+
+
+PO.DE$post.pattern <- ifelse(PO.DE$DE.6hUn == "Up" & PO.DE$DE.24hUn == "Not", "transient.up",
+                       ifelse(PO.DE$DE.6hUn == "Up" & PO.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(PO.DE$DE.6hUn == "Up" & PO.DE$DE.24hUn == "Down", "transient.up",
+                       ifelse(PO.DE$DE.6hUn == "Down" & PO.DE$DE.24hUn == "Not", "transient.down",
+                       ifelse(PO.DE$DE.6hUn == "Down" & PO.DE$DE.24hUn == "Up", "transient.down",
+                       ifelse(PO.DE$DE.6hUn == "Down" & PO.DE$DE.24hUn == "Down", "long.down",
+                       ifelse(PO.DE$DE.6hUn == "Not" & PO.DE$DE.24hUn == "Not", "not.DE",
+                       ifelse(PO.DE$DE.6hUn == "Not" & PO.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(PO.DE$DE.6hUn == "Not" & PO.DE$DE.24hUn == "Down", "long.down", "X"
+                       )))))))))
+
+PO.transient.up <- subset(PO.DE$fbgn, PO.DE$post.pattern == "transient.up")
+write.table(PO.transient.up, "PO.transient.up.txt", quote=F, row.names=F, col.names = F)
+
+PO.transient.down <- subset(PO.DE$fbgn, PO.DE$post.pattern == "transient.down")
+write.table(PO.transient.down, "PO.transient.down.txt", quote=F, row.names=F, col.names = F)
+
+PO.long.up <- subset(PO.DE$fbgn, PO.DE$post.pattern == "long.up")
+write.table(PO.long.up, "PO.long.up.txt", quote=F, row.names=F, col.names = F)
+
+PO.long.down <- subset(PO.DE$fbgn, PO.DE$post.pattern == "long.down")
+write.table(PO.long.down, "PO.long.down.txt", quote=F, row.names=F, col.names = F)
+
+####################################################################################################
+FB.DE$DE.6hUn <- ifelse (FB.DE$fbgn %in% FB.6hUn.up, "Up", ifelse (FB.DE$fbgn %in% FB.6hUn.down, "Down", "Not"))
+FB.DE$DE.24hUn <- ifelse (FB.DE$fbgn %in% FB.24hUn.up, "Up", ifelse (FB.DE$fbgn %in% FB.24hUn.down, "Down", "Not"))
+
+length(which(FB.DE$DE.6hUn == "Up" & FB.DE$DE.24hUn == "Not")) #468: transient.up
+length(which(FB.DE$DE.6hUn == "Up" & FB.DE$DE.24hUn == "Up")) #39: long.up
+length(which(FB.DE$DE.6hUn == "Up" & FB.DE$DE.24hUn == "Down")) #0: transient.up
+length(which(FB.DE$DE.6hUn == "Down" & FB.DE$DE.24hUn == "Not")) #188: transient.down
+length(which(FB.DE$DE.6hUn == "Down" & FB.DE$DE.24hUn == "Up")) #0: transient.down
+length(which(FB.DE$DE.6hUn == "Down" & FB.DE$DE.24hUn == "Down")) #19: long.down
+length(which(FB.DE$DE.6hUn == "Not" & FB.DE$DE.24hUn == "Not")) #4032: not DE
+length(which(FB.DE$DE.6hUn == "Not" & FB.DE$DE.24hUn == "Up")) #25: long.up
+length(which(FB.DE$DE.6hUn == "Not" & FB.DE$DE.24hUn == "Down")) #16: long.down
+
+
+FB.DE$post.pattern <- ifelse(FB.DE$DE.6hUn == "Up" & FB.DE$DE.24hUn == "Not", "transient.up",
+                       ifelse(FB.DE$DE.6hUn == "Up" & FB.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(FB.DE$DE.6hUn == "Up" & FB.DE$DE.24hUn == "Down", "transient.up",
+                       ifelse(FB.DE$DE.6hUn == "Down" & FB.DE$DE.24hUn == "Not", "transient.down",
+                       ifelse(FB.DE$DE.6hUn == "Down" & FB.DE$DE.24hUn == "Up", "transient.down",
+                       ifelse(FB.DE$DE.6hUn == "Down" & FB.DE$DE.24hUn == "Down", "long.down",
+                       ifelse(FB.DE$DE.6hUn == "Not" & FB.DE$DE.24hUn == "Not", "not.DE",
+                       ifelse(FB.DE$DE.6hUn == "Not" & FB.DE$DE.24hUn == "Up", "long.up",
+                       ifelse(FB.DE$DE.6hUn == "Not" & FB.DE$DE.24hUn == "Down", "long.down", "X"
+                       )))))))))
+
+FB.transient.up <- subset(FB.DE$fbgn, FB.DE$post.pattern == "transient.up")
+write.table(FB.transient.up, "FB.transient.up.txt", quote=F, row.names=F, col.names = F)
+
+FB.transient.down <- subset(FB.DE$fbgn, FB.DE$post.pattern == "transient.down")
+write.table(FB.transient.down, "FB.transient.down.txt", quote=F, row.names=F, col.names = F)
+
+FB.long.up <- subset(FB.DE$fbgn, FB.DE$post.pattern == "long.up")
+write.table(FB.long.up, "FB.long.up.txt", quote=F, row.names=F, col.names = F)
+
+FB.long.down <- subset(FB.DE$fbgn, FB.DE$post.pattern == "long.down")
+write.table(FB.long.down, "FB.long.down.txt", quote=F, row.names=F, col.names = F)
+
+####################################################################################################
+DE.cat <- data.frame(c("BUR", "OVD", "SR", "ST", "PO", "FB"),
+          c(length(BUR.transient.up), length(OVD.transient.up), length(SR.transient.up), length(ST.transient.up), length(PO.transient.up), length(FB.transient.up)),
+          c(length(BUR.transient.down), length(OVD.transient.down), length(SR.transient.down), length(ST.transient.down), length(PO.transient.down), length(FB.transient.down)),
+          c(length(BUR.long.up), length(OVD.long.up), length(SR.long.up), length(ST.long.up), length(PO.long.up), length(FB.long.up)),
+          c(length(BUR.long.down), length(OVD.long.down), length(SR.long.down), length(ST.long.down), length(PO.long.down), length(FB.long.down)))
+
+colnames(DE.cat) <- c("tissue", "transient.up", "transient.down", "longterm.up", "longterm.down")
+DE.cat$transient <- DE.cat$transient.up + DE.cat$transient.down
+DE.cat$long <- DE.cat$longterm.up + DE.cat$longterm.down
+DE.cat$porp.trans <- (DE.cat$transient / (DE.cat$transient + DE.cat$long))*100
+mean(DE.cat$porp.trans)
+st.err(DE.cat$porp.trans)
+
+DE.cat$porp.long <- (DE.cat$long / (DE.cat$transient + DE.cat$long))*100
+mean(DE.cat$porp.long)
+st.err(DE.cat$porp.long)
+
+chisq.test(DE.cat[,c(6,7)]) 
+chisq.test(DE.cat[,c(6,7)])$p.value #super sig
+
+Supp1.DE <- join_all(list(BUR.DE, OVD.DE, SR.DE, ST.DE, PO.DE, FB.DE), by='fbgn', type='full')
+write.table(Supp1.DE, "Supp1.DE.txt", col.names = T, row.names = F)
+```
+
+
+Comparing postmating expression of different tissues (unmated to 6hrs postmating)
+```{r}
+Tissue.post.spread6 <- Tissue.post[,c("fbgn", "tissue", "logFC.6hUn", "FDR.6hUn")]
+Tissue.post.spread6 <- dcast(melt(Tissue.post.spread6, id.vars=c("fbgn", "tissue")), fbgn~tissue+variable)
+
+Tissue.post.spread24 <- Tissue.post[,c("fbgn", "tissue", "logFC.24h6h", "FDR.24h6h")]
+Tissue.post.spread24 <- dcast(melt(Tissue.post.spread24, id.vars=c("fbgn", "tissue")), fbgn~tissue+variable)
+
+Tissue.post.spread <- full_join( Tissue.post.spread6, Tissue.post.spread24, by="fbgn")
+
+#tiff('Fig6.BUROVD6.tiff', units="in", width=5, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.6hUn, Tissue.post.spread$BUR_FDR.6hUn, bur.col, 
+                            Tissue.post.spread$OVD_logFC.6hUn, Tissue.post.spread$OVD_FDR.6hUn, ovd.col, 
+                            "top", "right", element_text(size=20, face="bold"), element_blank())
+#dev.off()
+#tiff('Fig6.BURSR6.tiff', units="in", width=5, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.6hUn, Tissue.post.spread$BUR_FDR.6hUn, bur.col, 
+                            Tissue.post.spread$SR_logFC.6hUn, Tissue.post.spread$SR_FDR.6hUn, sr.col, 
+                            "top", "right",element_text(size=20, face="bold"), element_blank())
+#dev.off()
+#tiff('Fig6.BURPO6.tiff', units="in", width=5, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.6hUn, Tissue.post.spread$BUR_FDR.6hUn, bur.col, 
+                            Tissue.post.spread$PO_logFC.6hUn, Tissue.post.spread$PO_FDR.6hUn, po.col, 
+                            "top", "right",element_text(size=20, face="bold"), element_blank())
+#dev.off()
+#tiff('Fig6.BURST6.tiff', units="in", width=5.25, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.6hUn, Tissue.post.spread$BUR_FDR.6hUn, bur.col, 
+                            Tissue.post.spread$ST_logFC.6hUn, Tissue.post.spread$ST_FDR.6hUn, st.col, 
+                            "top", "right",element_text(size=20, face="bold"), element_text(size=20, face="bold"))
+#dev.off()
+
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$OVD_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn)) *4
+
+
+#tiff('Fig6.OVDSR6.tiff', units="in", width=5, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$OVD_logFC.6hUn, Tissue.post.spread$OVD_FDR.6hUn, ovd.col, 
+                            Tissue.post.spread$SR_logFC.6hUn, Tissue.post.spread$SR_FDR.6hUn, sr.col, 
+                            "top", "right",element_blank(), element_blank())
+#dev.off()
+#tiff('Fig6.OVDPO6.tiff', units="in", width=5, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$OVD_logFC.6hUn, Tissue.post.spread$OVD_FDR.6hUn, ovd.col, 
+                            Tissue.post.spread$PO_logFC.6hUn, Tissue.post.spread$PO_FDR.6hUn, po.col, 
+                            "top", "right",element_blank(), element_blank())
+#dev.off()
+#tiff('Fig6.OVDST6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$OVD_logFC.6hUn, Tissue.post.spread$OVD_FDR.6hUn, ovd.col, 
+                            Tissue.post.spread$ST_logFC.6hUn, Tissue.post.spread$ST_FDR.6hUn, st.col, 
+                            "top", "right",element_blank(), element_text(size=20, face="bold"))
+#dev.off()
+
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn)) *4
+
+
+#tiff('Fig6.SRPO6.tiff', units="in", width=5, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$SR_logFC.6hUn, Tissue.post.spread$SR_FDR.6hUn, sr.col, 
+                            Tissue.post.spread$PO_logFC.6hUn, Tissue.post.spread$PO_FDR.6hUn, po.col, 
+                            "top", "right",element_blank(), element_blank())
+#dev.off()
+#tiff('Fig6.SRST6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$SR_logFC.6hUn, Tissue.post.spread$SR_FDR.6hUn, sr.col, 
+                            Tissue.post.spread$ST_logFC.6hUn, Tissue.post.spread$ST_FDR.6hUn, st.col, 
+                            "top", "right",element_blank(), element_text(size=20, face="bold"))
+#dev.off()
+
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn)) *4
+
+
+#tiff('Fig6.POST6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$PO_logFC.6hUn, Tissue.post.spread$PO_FDR.6hUn, po.col, 
+                            Tissue.post.spread$ST_logFC.6hUn, Tissue.post.spread$ST_FDR.6hUn, st.col, 
+                            "top", "right",element_blank(), element_text(size=20, face="bold"))
+#dev.off()
+
+round(summary(lm(Tissue.post.spread$ST_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2)
+lmp(lm(Tissue.post.spread$ST_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))
+
+
+mean(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2))) # 0.35
+
+st.err(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2))) # 0.06
+```
+
+```{r}
+mean(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2)))
+
+
+st.err(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2)))
+
+```
+
+
+Comparing postmating expression of different tissues (6hrs to 24hrs postmating)
+```{r}
+# 24hr compared to 6hr
+#tiff('Fig6.BUROVD24.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.24h6h, Tissue.post.spread$BUR_FDR.24h6h, bur.col, 
+                            Tissue.post.spread$OVD_logFC.24h6h, Tissue.post.spread$OVD_FDR.24h6h, ovd.col, 
+                            "bottom", "left", element_blank(), element_text(size=20, face="bold"))
+#dev.off()
+#tiff('Fig6.BURSR24.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.24h6h, Tissue.post.spread$BUR_FDR.24h6h, bur.col, 
+                            Tissue.post.spread$SR_logFC.24h6h, Tissue.post.spread$SR_FDR.24h6h, sr.col, 
+                            "bottom", "left", element_blank(), element_text(size=20, face="bold"))
+#dev.off()
+#tiff('Fig6.BURPO24.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.24h6h, Tissue.post.spread$BUR_FDR.24h6h, bur.col, 
+                            Tissue.post.spread$PO_logFC.24h6h, Tissue.post.spread$PO_FDR.24h6h, po.col, 
+                            "bottom", "left", element_blank(), element_text(size=20, face="bold"))
+#dev.off()
+#tiff('Fig6.BURST24.tiff', units="in", width=5.25, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$BUR_logFC.24h6h, Tissue.post.spread$BUR_FDR.24h6h, bur.col, 
+                            Tissue.post.spread$ST_logFC.24h6h, Tissue.post.spread$ST_FDR.24h6h, st.col, 
+                            "bottom", "left",element_text(size=20, face="bold"), element_text(size=20, face="bold"))
+#dev.off()
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$OVD_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$OVD_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h)) *4
+
+#tiff('Fig6.OVDSR24.tiff', units="in", width=5, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$OVD_logFC.24h6h, Tissue.post.spread$OVD_FDR.24h6h, ovd.col, 
+                            Tissue.post.spread$SR_logFC.24h6h, Tissue.post.spread$SR_FDR.24h6h, sr.col, 
+                            "bottom", "left",element_blank(), element_blank())
+#dev.off()
+#tiff('Fig6.OVDPO24.tiff', units="in", width=5, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$OVD_logFC.24h6h, Tissue.post.spread$OVD_FDR.24h6h, ovd.col, 
+                            Tissue.post.spread$PO_logFC.24h6h, Tissue.post.spread$PO_FDR.24h6h, po.col, 
+                            "bottom", "left",element_blank(), element_blank())
+#dev.off()
+#tiff('Fig6.OVDST24.tiff', units="in", width=5, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$OVD_logFC.24h6h, Tissue.post.spread$OVD_FDR.24h6h, ovd.col, 
+                            Tissue.post.spread$ST_logFC.24h6h, Tissue.post.spread$ST_FDR.24h6h, st.col, 
+                            "bottom", "left",element_text(size=20, face="bold"), element_blank())
+#dev.off()
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h)) *4
+
+#tiff('Fig6.SRPO24.tiff', units="in", width=5, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$SR_logFC.24h6h, Tissue.post.spread$SR_FDR.24h6h, sr.col, 
+                            Tissue.post.spread$PO_logFC.24h6h, Tissue.post.spread$PO_FDR.24h6h, po.col, 
+                            "bottom", "left",element_blank(), element_blank())
+#dev.off()
+#tiff('Fig6.SRST24.tiff', units="in", width=5, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$SR_logFC.24h6h, Tissue.post.spread$SR_FDR.24h6h, sr.col, 
+                            Tissue.post.spread$ST_logFC.24h6h, Tissue.post.spread$ST_FDR.24h6h, st.col, 
+                            "bottom", "left",element_text(size=20, face="bold"), element_blank())
+#dev.off()
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h)) *4
+
+#tiff('Fig6.POST24.tiff', units="in", width=5, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$PO_logFC.24h6h, Tissue.post.spread$PO_FDR.24h6h, po.col, 
+                            Tissue.post.spread$ST_logFC.24h6h, Tissue.post.spread$ST_FDR.24h6h, st.col, 
+                            "bottom", "left",element_text(size=20, face="bold"), element_blank())
+#dev.off()
+round(summary(lm(Tissue.post.spread$ST_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2)
+lmp(lm(Tissue.post.spread$ST_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h)) * 4
+
+mean(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~Tissue.post.spread$OVD_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2))) # 0.31
+
+st.err(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~Tissue.post.spread$OVD_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2))) # 0.04
+```
+
+```{r}
+mean(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2)))
+
+
+st.err(c(
+round(summary(lm(Tissue.post.spread$BUR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$BUR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$OVD_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$SR_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$ST_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2)))
+```
+
+
+Tissue comparisons to the FB
+Correlations were so low I didn't include them in the figure
+```{r}
+#unmated to 6hrs
+
+#tiff('Fig6.FBBUR6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.6hUn, Tissue.post.spread$FB_FDR.6hUn, fb.col, 
+                            Tissue.post.spread$BUR_logFC.6hUn, Tissue.post.spread$BUR_FDR.6hUn, bur.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+#dev.off()
+
+#tiff('Fig6.FBOVD6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.6hUn, Tissue.post.spread$FB_FDR.6hUn, fb.col, 
+                            Tissue.post.spread$OVD_logFC.6hUn, Tissue.post.spread$OVD_FDR.6hUn, ovd.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+#dev.off()
+#tiff('Fig6.FBSR6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.6hUn, Tissue.post.spread$FB_FDR.6hUn, fb.col, 
+                            Tissue.post.spread$SR_logFC.6hUn, Tissue.post.spread$SR_FDR.6hUn, sr.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+#dev.off()
+#tiff('Fig6.FBPO6.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.6hUn, Tissue.post.spread$FB_FDR.6hUn, fb.col, 
+                            Tissue.post.spread$PO_logFC.6hUn, Tissue.post.spread$PO_FDR.6hUn, po.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+#dev.off()
+#tiff('Fig6.FBST6.tiff', units="in", width=5.25, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.6hUn, Tissue.post.spread$FB_FDR.6hUn, fb.col, 
+                            Tissue.post.spread$ST_logFC.6hUn, Tissue.post.spread$ST_FDR.6hUn, st.col, 
+                            "bottom", "left",element_text(size=20, face="bold"), element_text(size=20, face="bold"))
+#dev.off()
+
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$BUR_logFC.6hUn))$r.squared, 2) #0
+lmp(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$BUR_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2) #0.01
+lmp(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$OVD_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2) #0.04
+lmp(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2) #0
+lmp(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2)#0.11
+lmp(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn)) *4
+
+
+#6hrs to 24hrs
+
+tiff('Fig6.FBBUR24.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.24h6h, Tissue.post.spread$FB_FDR.24h6h, fb.col, 
+                            Tissue.post.spread$BUR_logFC.24h6h, Tissue.post.spread$BUR_FDR.24h6h, bur.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+dev.off()
+
+tiff('Fig6.FBOVD24.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.24h6h, Tissue.post.spread$FB_FDR.24h6h, fb.col, 
+                            Tissue.post.spread$OVD_logFC.24h6h, Tissue.post.spread$OVD_FDR.24h6h, ovd.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+dev.off()
+
+tiff('Fig6.FBSR24.tiff', units="in", width=5.25, height=5, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.24h6h, Tissue.post.spread$FB_FDR.24h6h, fb.col, 
+                            Tissue.post.spread$SR_logFC.24h6h, Tissue.post.spread$SR_FDR.24h6h, sr.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+dev.off()
+tiff('Fig6.FBPO24.tiff', units="in", width=5.25, height=5., res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.24h6h, Tissue.post.spread$FB_FDR.24h6h, fb.col, 
+                            Tissue.post.spread$PO_logFC.24h6h, Tissue.post.spread$PO_FDR.24h6h, po.col, 
+                            "bottom", "left", element_blank(),element_text(size=20, face="bold"))
+dev.off()
+
+tiff('Fig6.FBST24.tiff', units="in", width=5.25, height=5.25, res=300)
+postmating.tissuecomparison(Tissue.post.spread$FB_logFC.24h6h, Tissue.post.spread$FB_FDR.24h6h, fb.col, 
+                            Tissue.post.spread$ST_logFC.24h6h, Tissue.post.spread$ST_FDR.24h6h, st.col, 
+                            "bottom", "left",element_text(size=20, face="bold"),element_text(size=20, face="bold"))
+dev.off()
+
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$BUR_logFC.24h6h))$r.squared, 2) #0.03
+lmp(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$BUR_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$OVD_logFC.24h6h))$r.squared, 2) #0.05
+lmp(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$OVD_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2) #0.12
+lmp(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2) #0.02
+lmp(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h)) *4
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2)#0.05
+lmp(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h)) *4
+
+#mean and standard error for 6h postmating
+mean(c(round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$BUR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2))) # 0.032
+
+st.err(c(round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$BUR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$OVD_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$SR_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$PO_logFC.6hUn))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.6hUn ~ Tissue.post.spread$ST_logFC.6hUn))$r.squared, 2))) # 0.02
+
+#mean and se for 24h postmating
+mean(c(round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$BUR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$OVD_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2)))
+
+st.err(c(round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$BUR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$OVD_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$SR_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$PO_logFC.24h6h))$r.squared, 2),
+round(summary(lm(Tissue.post.spread$FB_logFC.24h6h ~ Tissue.post.spread$ST_logFC.24h6h))$r.squared, 2)))
+
+```
+
+
+Clustering postmating expression
+As these clusters are not fixed there is small variation every time they are run
+```{r}
+BUR.Avg.post <- Avg.log[,grep('BUR', colnames(Avg.log))]
+BUR.Avg.post <- BUR.Avg.post[,c(3,2,1)]
+BUR.Avg.post <- subset(BUR.Avg.post, rownames(BUR.Avg.post) %in% cpmFRT.BUR)
+
+mfuzz_data <- ExpressionSet(assayData = as.matrix(BUR.Avg.post))
+mfuzz_std <- standardise(mfuzz_data)
+# Estimate fuzzifier
+m1 = mestimate (mfuzz_std)
+
+# Estimate cluster number
+# Optimal num at jump in minimal centroid distance (Dmin) and partition coef. 
+cselection (mfuzz_std, m1, crange = seq (2,20,1), repeats = 5, visu = TRUE)
+
+tiff('BUR.Dmin.tiff', units="in", width=4, height=4, res=300)
+Dmin (mfuzz_std, m1, crange = seq (2,15,1), repeats = 20, visu = TRUE)
+dev.off()
+
+pcoef = partcoef (mfuzz_std, crange = seq (2,15,1), mrange = m1)
+tiff('BUR.pcoef.tiff', units="in", width=4, height=4, res=300)
+par(mfrow = c(1, 3)); plot(pcoef[[1]]);plot(pcoef[[2]]);plot(pcoef[[3]])
+dev.off()
+
+clusters = mfuzz (mfuzz_std, c=2, m=m1)
+overlap = overlap (clusters)
+
+plot(clusters[[1]][1,], type="l", ylab="Expression")
+overlap.plot (clusters, overlap)
+
+BUR.membership<- data.frame(clusters$membership)
+BUR.clust1 <- rownames(subset(BUR.membership, BUR.membership$X1 > 0.75))
+write.table(BUR.clust1, "BUR.clust1.txt", quote=F, row.names=F, col.names=F) #1991 genes
+BUR.clust2 <- rownames(subset(BUR.membership, BUR.membership$X2 > 0.75))
+write.table(BUR.clust2, "BUR.clust2.txt", quote=F, row.names=F, col.names=F) #2005 genes
+
+tiff('Fig6FuzzBUR1.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 80), rep(bur.col, 20))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=1, x11=F, Xwidth = 4, Xheight = 4, col.main =NA)
+dev.off()
+
+tiff('Fig6FuzzBUR2.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 80), rep(bur.col, 20))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=2, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+######################################################################################################
+
+OVD.Avg.post <- Avg.log[,grep('OVD', colnames(Avg.log))]
+OVD.Avg.post <- OVD.Avg.post[,c(3,2,1)]
+OVD.Avg.post <- subset(OVD.Avg.post, rownames(OVD.Avg.post) %in% cpmFRT.OVD)
+
+mfuzz_data <- ExpressionSet(assayData = as.matrix(OVD.Avg.post))
+mfuzz_std <- standardise(mfuzz_data)
+# Estimate fuzzifier
+m1 = mestimate (mfuzz_std)
+
+# Estimate cluster number
+# Optimal num at jump in minimal centroid distance (Dmin) and partition coef. 
+cselection (mfuzz_std, m1, crange = seq (2,20,1), repeats = 5, visu = TRUE)
+
+tiff('OVD.Dmin.tiff', units="in", width=4, height=4, res=300)
+Dmin (mfuzz_std, m1, crange = seq (2,15,1), repeats = 20, visu = TRUE)
+dev.off()
+
+pcoef = partcoef (mfuzz_std, crange = seq (2,15,1), mrange = m1)
+tiff('OVD.pcoef.tiff', units="in", width=4, height=4, res=300)
+par(mfrow = c(1, 3)); plot(pcoef[[1]]);plot(pcoef[[2]]);plot(pcoef[[3]])
+dev.off()
+
+clusters = mfuzz (mfuzz_std, c=2, m=m1)
+
+plot(clusters[[1]][1,], type="l", ylab="Expression")
+overlap.plot (clusters, overlap)
+
+OVD.membership<- data.frame(clusters$membership)
+OVD.clust1 <- rownames(subset(OVD.membership, OVD.membership$X1 > 0.75))
+write.table(OVD.clust1, "OVD.clust1.txt", quote=F, row.names=F, col.names=F) #1991 genes
+OVD.clust2 <- rownames(subset(OVD.membership, OVD.membership$X2 > 0.75))
+write.table(OVD.clust2, "OVD.clust2.txt", quote=F, row.names=F, col.names=F) #2005 genes
+
+tiff('Fig6FuzzOVD1.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 80), rep(ovd.col, 20))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=1, x11=F, Xwidth = 4, Xheight = 4, col.main =NA)
+dev.off()
+
+tiff('Fig6FuzzOVD2.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 80), rep(ovd.col, 20))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=2, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+######################################################################################################
+
+SR.Avg.post <- Avg.log[,grep('SR', colnames(Avg.log))]
+SR.Avg.post <- SR.Avg.post[,c(3,2,1)]
+SR.Avg.post <- subset(SR.Avg.post, rownames(SR.Avg.post) %in% cpmFRT.SR)
+
+mfuzz_data <- ExpressionSet(assayData = as.matrix(SR.Avg.post))
+mfuzz_std <- standardise(mfuzz_data)
+# Estimate fuzzifier
+m1 = mestimate (mfuzz_std)
+
+# Estimate cluster number
+# Optimal num at jump in minimal centroid distance (Dmin) and partition coef. 
+cselection (mfuzz_std, m1, crange = seq (2,20,1), repeats = 5, visu = TRUE)
+
+tiff('SR.Dmin.tiff', units="in", width=4, height=4, res=300)
+Dmin (mfuzz_std, m1, crange = seq (2,15,1), repeats = 20, visu = TRUE)
+dev.off()
+
+pcoef = partcoef (mfuzz_std, crange = seq (2,15,1), mrange = m1)
+tiff('SR.pcoef.tiff', units="in", width=4, height=4, res=300)
+par(mfrow = c(1, 3)); plot(pcoef[[1]]);plot(pcoef[[2]]);plot(pcoef[[3]])
+dev.off()
+
+clusters = mfuzz (mfuzz_std, c=2, m=m1)
+#tried 3 clusters and nothing has membership > 0.75 so went with only 2
+
+plot(clusters[[1]][1,], type="l", ylab="Expression")
+overlap.plot (clusters, overlap)
+
+SR.membership<- data.frame(clusters$membership)
+SR.clust1 <- rownames(subset(SR.membership, SR.membership$X1 > 0.75))
+write.table(SR.clust1, "SR.clust1.txt", quote=F, row.names=F, col.names=F) 
+SR.clust2 <- rownames(subset(SR.membership, SR.membership$X2 > 0.75))
+write.table(SR.clust2, "SR.clust2.txt", quote=F, row.names=F, col.names=F) 
+
+tiff('Fig6FuzzSR1.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 78), rep(sr.col, 22))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=1, x11=F, Xwidth = 4, Xheight = 4, col.main =NA)
+dev.off()
+
+tiff('Fig6FuzzSR2.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 78), rep(sr.col, 22))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=2, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+######################################################################################################
+
+ST.Avg.post <- Avg.log[,grep('ST', colnames(Avg.log))]
+ST.Avg.post <- ST.Avg.post[,c(3,2,1)]
+ST.Avg.post <- subset(ST.Avg.post, rownames(ST.Avg.post) %in% cpmFRT.ST)
+
+mfuzz_data <- ExpressionSet(assayData = as.matrix(ST.Avg.post))
+mfuzz_std <- standardise(mfuzz_data)
+# Estimate fuzzifier
+m1 = mestimate (mfuzz_std)
+
+# Estimate cluster number
+# Optimal num at jump in minimal centroid distance (Dmin) and partition coef. 
+cselection (mfuzz_std, m1, crange = seq (2,20,1), repeats = 5, visu = TRUE)
+
+tiff('ST.Dmin.tiff', units="in", width=4, height=4, res=300)
+Dmin (mfuzz_std, m1, crange = seq (2,15,1), repeats = 20, visu = TRUE)
+dev.off()
+
+pcoef = partcoef (mfuzz_std, crange = seq (2,15,1), mrange = m1)
+tiff('ST.pcoef.tiff', units="in", width=4, height=4, res=300)
+par(mfrow = c(1, 3)); plot(pcoef[[1]]);plot(pcoef[[2]]);plot(pcoef[[3]])
+dev.off()
+
+clusters = mfuzz (mfuzz_std, c=3, m=m1)
+
+plot(clusters[[1]][1,], type="l", ylab="Expression")
+#overlap.plot (clusters, overlap)
+
+ST.membership<- data.frame(clusters$membership)
+ST.clust1 <- rownames(subset(ST.membership, ST.membership$X1 > 0.50))
+write.table(ST.clust1, "ST.clust1.txt", quote=F, row.names=F, col.names=F) 
+ST.clust2 <- rownames(subset(ST.membership, ST.membership$X2 > 0.50))
+write.table(ST.clust2, "ST.clust2.txt", quote=F, row.names=F, col.names=F) 
+ST.clust3 <- rownames(subset(ST.membership, ST.membership$X3 > 0.50))
+write.table(ST.clust3, "ST.clust3.txt", quote=F, row.names=F, col.names=F) 
+
+tiff('Fig6FuzzST1.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 75), rep(st.col, 25))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.50, single=1, x11=F, Xwidth = 4, Xheight = 4, col.main =NA)
+dev.off()
+
+tiff('Fig6FuzzST2.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 75), rep(st.col, 25))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.50, single=2, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+tiff('Fig6FuzzST3.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 75), rep(st.col, 25))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.50, single=3, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+######################################################################################################
+
+PO.Avg.post <- Avg.log[,grep('PO', colnames(Avg.log))]
+PO.Avg.post <- PO.Avg.post[,c(3,2,1)]
+PO.Avg.post <- subset(PO.Avg.post, rownames(PO.Avg.post) %in% cpmFRT.PO)
+
+mfuzz_data <- ExpressionSet(assayData = as.matrix(PO.Avg.post))
+mfuzz_std <- standardise(mfuzz_data)
+# Estimate fuzzifier
+m1 = mestimate (mfuzz_std)
+
+# Estimate cluster number
+# Optimal num at jump in minimal centroid distance (Dmin) and partition coef. 
+cselection (mfuzz_std, m1, crange = seq (2,20,1), repeats = 5, visu = TRUE)
+
+tiff('PO.Dmin.tiff', units="in", width=4, height=4, res=300)
+Dmin (mfuzz_std, m1, crange = seq (2,15,1), repeats = 20, visu = TRUE)
+dev.off()
+
+pcoef = partcoef (mfuzz_std, crange = seq (2,15,1), mrange = m1)
+tiff('PO.pcoef.tiff', units="in", width=4, height=4, res=300)
+par(mfrow = c(1, 3)); plot(pcoef[[1]]);plot(pcoef[[2]]);plot(pcoef[[3]])
+dev.off()
+
+clusters = mfuzz (mfuzz_std, c=2, m=m1)
+
+plot(clusters[[1]][1,], type="l", ylab="Expression")
+overlap.plot (clusters, overlap)
+
+PO.membership<- data.frame(clusters$membership)
+PO.clust1 <- rownames(subset(PO.membership, PO.membership$X1 > 0.75))
+write.table(PO.clust1, "PO.clust1.txt", quote=F, row.names=F, col.names=F) 
+PO.clust2 <- rownames(subset(PO.membership, PO.membership$X2 > 0.75))
+write.table(PO.clust2, "PO.clust2.txt", quote=F, row.names=F, col.names=F)
+
+tiff('Fig6FuzzPO1.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 80), rep(po.col, 20))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=1, x11=F, Xwidth = 4, Xheight = 4, col.main =NA)
+dev.off()
+
+tiff('Fig6FuzzPO2.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 80), rep(po.col, 20))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.75, single=2, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+######################################################################################################
+
+FB.Avg.post <- Avg.log[,grep('FB', colnames(Avg.log))]
+FB.Avg.post <- FB.Avg.post[,c(3,2,1)]
+FB.Avg.post <- subset(FB.Avg.post, rownames(FB.Avg.post) %in% cpmFRT.FB)
+
+mfuzz_data <- ExpressionSet(assayData = as.matrix(FB.Avg.post))
+mfuzz_std <- standardise(mfuzz_data)
+# Estimate fuzzifier
+m1 = mestimate (mfuzz_std)
+
+# Estimate cluster number
+# Optimal num at jump in minimal centroid distance (Dmin) and partition coef. 
+cselection (mfuzz_std, m1, crange = seq (2,20,1), repeats = 5, visu = TRUE)
+
+tiff('FB.Dmin.tiff', units="in", width=4, height=4, res=300)
+Dmin (mfuzz_std, m1, crange = seq (2,15,1), repeats = 20, visu = TRUE)
+dev.off()
+
+pcoef = partcoef (mfuzz_std, crange = seq (2,15,1), mrange = m1)
+tiff('FB.pcoef.tiff', units="in", width=4, height=4, res=300)
+par(mfrow = c(1, 3)); plot(pcoef[[1]]);plot(pcoef[[2]]);plot(pcoef[[3]])
+dev.off()
+
+clusters = mfuzz (mfuzz_std, c=3, m=m1)
+
+plot(clusters[[1]][1,], type="l", ylab="Expression")
+#overlap.plot (clusters, overlap)
+
+FB.membership<- data.frame(clusters$membership)
+FB.clust1 <- rownames(subset(FB.membership, FB.membership$X1 > 0.50))
+write.table(FB.clust1, "FB.clust1.txt", quote=F, row.names=F, col.names=F) #1991 genes
+FB.clust2 <- rownames(subset(FB.membership, FB.membership$X2 > 0.50))
+write.table(FB.clust2, "FB.clust2.txt", quote=F, row.names=F, col.names=F) #2005 genes
+FB.clust3 <- rownames(subset(FB.membership, FB.membership$X3 > 0.50))
+write.table(FB.clust3, "FB.clust3.txt", quote=F, row.names=F, col.names=F) #2005 genes
+
+
+tiff('Fig6FuzzFB1.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 75), rep(fb.col, 25))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.50, single=1, x11=F, Xwidth = 4, Xheight = 4, col.main =NA)
+dev.off()
+
+tiff('Fig6FuzzFB2.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 75), rep(fb.col, 25))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.50, single=2, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+tiff('Fig6FuzzFB3.tiff', units="in", width=4, height=4, res=300)
+mfuzz.plot2 (eset=mfuzz_std, cl=clusters, colo = c(c(rep("grey75", 75), rep(fb.col, 25))), time.labels = c("Unmated", "6hrs", "24hrs"), min.mem = 0.50, single=3, x11=F, Xwidth = 4, Xheight = 4, col.main=NA)
+dev.off()
+
+######################################################################################################
+
+```
+
+Create a supplementary file of cluster membership
+```{r}
+colnames(BUR.membership) <- c("BUR.Clust1", "BUR.Clust2")
+BUR.membership$fbgn <- row.names(BUR.membership)
+colnames(OVD.membership) <- c("OVD.Clust1", "OVD.Clust2")
+OVD.membership$fbgn <- row.names(OVD.membership)
+colnames(SR.membership) <- c("SR.Clust1", "SR.Clust2")
+SR.membership$fbgn <- row.names(SR.membership)
+colnames(ST.membership) <- c("ST.Clust1", "ST.Clust2", "ST.Clust3")
+ST.membership$fbgn <- row.names(ST.membership)
+colnames(PO.membership) <- c("PO.Clust1", "PO.Clust2")
+PO.membership$fbgn <- row.names(PO.membership)
+colnames(FB.membership) <- c("FB.Clust1", "FB.Clust2", "FB.Clust3")
+FB.membership$fbgn <- row.names(FB.membership)
+
+Supp1.Clusters <- join_all(list(BUR.membership, OVD.membership, SR.membership, ST.membership, PO.membership, FB.membership), by='fbgn', type='full')
+write.table(Supp1.Clusters, "Supp1.Clusters.txt", col.names=T, row.names = F)
+```
+
+Look at the extent of overlap between high membership clusters and the number of genes in the different clusters for each tissue
+```{r}
+length(which(BUR.clust1 %in% BUR.clust2)) 
+length(which(OVD.clust1 %in% OVD.clust2)) 
+length(which(SR.clust1 %in% SR.clust2)) 
+length(which(ST.clust1 %in% ST.clust2)) 
+length(which(ST.clust1 %in% ST.clust3)) 
+length(which(ST.clust2 %in% ST.clust3)) 
+length(which(PO.clust1 %in% PO.clust2))
+length(which(FB.clust1 %in% FB.clust2))
+length(which(FB.clust1 %in% FB.clust3))
+length(which(FB.clust2 %in% FB.clust3))
+# nope none!
+
+clust <- data.frame(cbind(
+                    c(length(BUR.clust2), length(OVD.clust2),length(SR.clust1), length(PO.clust2)),
+                    c(length(BUR.clust1), length(OVD.clust1), length(SR.clust2), length(PO.clust1)),
+                    c(6920, 7644, 7748, 6723)))
+colnames(clust) <- c("UpDown", "DownUp", "Total")
+rownames(clust) <- c("BUR", "OVD", "SR", "PO")
+clust$inclust <- clust$UpDown + clust$DownUp
+clust$percent <- clust$inclust / clust$Total
+
+clust2 <- data.frame(cbind(
+                    c(length(ST.clust1), length(FB.clust3)),
+                    c(length(ST.clust3), length(FB.clust1)),
+                    c(length(ST.clust2), length(FB.clust2)),
+                    c(7000, 4787)))
+colnames(clust2) <- c("UpDown", "UpUp","DownDown", "Total")
+rownames(clust2) <- c("ST", "FB")
+clust2$inclust2 <- clust2$UpDown + clust2$DownDown + clust2$UpUp
+clust2$percent <- clust2$inclust2 / clust2$Total
+colMeans(clust2)
+```
+
+
+check overlabs between clusters and DE genes
+```{r}
+
+BUR.clust <- data.frame(cbind(
+  c(length(which(BUR.6hUn.up %in% BUR.clust1 | BUR.6hUn.up %in% BUR.clust2)),length(which(BUR.6hUn.down %in% BUR.clust1 | BUR.6hUn.down %in% BUR.clust2)),length(which(BUR.24hUn.up %in% BUR.clust1 | BUR.24hUn.up %in% BUR.clust2)),length(which(BUR.24hUn.down %in% BUR.clust1 | BUR.24hUn.down %in% BUR.clust2))),
+  c(length(BUR.6hUn.up), length(BUR.6hUn.down), length(BUR.24hUn.up), length(BUR.24hUn.down))))
+colnames(BUR.clust) <- c("overlap", "DE")
+rownames(BUR.clust) <- c("Up6", "Down6", "Up24", "Down24")
+BUR.clust$prop <- BUR.clust$overlap / BUR.clust$DE
+
+OVD.clust <- data.frame(cbind(
+  c(length(which(OVD.6hUn.up %in% OVD.clust1 | OVD.6hUn.up %in% OVD.clust2)),length(which(OVD.6hUn.down %in% OVD.clust1 | OVD.6hUn.down %in% OVD.clust2)),length(which(OVD.24hUn.up %in% OVD.clust1 | OVD.24hUn.up %in% OVD.clust2)),length(which(OVD.24hUn.down %in% OVD.clust1 | OVD.24hUn.down %in% OVD.clust2))),
+  c(length(OVD.6hUn.up), length(OVD.6hUn.down), length(OVD.24hUn.up), length(OVD.24hUn.down))))
+colnames(OVD.clust) <- c("overlap", "DE")
+rownames(OVD.clust) <- c("Up6", "Down6", "Up24", "Down24")
+OVD.clust$prop <- OVD.clust$overlap / OVD.clust$DE
+
+SR.clust <- data.frame(cbind(
+  c(length(which(SR.6hUn.up %in% SR.clust1 | SR.6hUn.up %in% SR.clust2)),length(which(SR.6hUn.down %in% SR.clust1 | SR.6hUn.down %in% SR.clust2)),length(which(SR.24hUn.up %in% SR.clust1 | SR.24hUn.up %in% SR.clust2)),length(which(SR.24hUn.down %in% SR.clust1 | SR.24hUn.down %in% SR.clust2))),
+  c(length(SR.6hUn.up), length(SR.6hUn.down), length(SR.24hUn.up), length(SR.24hUn.down))))
+colnames(SR.clust) <- c("overlap", "DE")
+rownames(SR.clust) <- c("Up6", "Down6", "Up24", "Down24")
+SR.clust$prop <- SR.clust$overlap / SR.clust$DE
+
+PO.clust <- data.frame(cbind(
+  c(length(which(PO.6hUn.up %in% PO.clust1 | PO.6hUn.up %in% PO.clust2)),length(which(PO.6hUn.down %in% PO.clust1 | PO.6hUn.down %in% PO.clust2)),length(which(PO.24hUn.up %in% PO.clust1 | PO.24hUn.up %in% PO.clust2)),length(which(PO.24hUn.down %in% PO.clust1 | PO.24hUn.down %in% PO.clust2))),
+  c(length(PO.6hUn.up), length(PO.6hUn.down), length(PO.24hUn.up), length(PO.24hUn.down))))
+colnames(PO.clust) <- c("overlap", "DE")
+rownames(PO.clust) <- c("Up6", "Down6", "Up24", "Down24")
+PO.clust$prop <- PO.clust$overlap / PO.clust$DE
+
+ST.clust <- data.frame(cbind(
+  c(length(which(ST.6hUn.up %in% ST.clust1 | ST.6hUn.up %in% ST.clust2 | ST.6hUn.up %in% ST.clust3)),
+    length(which(ST.6hUn.down %in% ST.clust1 | ST.6hUn.down %in% ST.clust2 | ST.6hUn.down %in% ST.clust3)),
+    length(which(ST.24hUn.up %in% ST.clust1 | ST.24hUn.up %in% ST.clust2 | ST.24hUn.up %in% ST.clust3)),
+    length(which(ST.24hUn.down %in% ST.clust1 | ST.24hUn.down %in% ST.clust2 | ST.24hUn.down %in% ST.clust3))),
+  c(length(ST.6hUn.up), length(ST.6hUn.down), length(ST.24hUn.up), length(ST.24hUn.down))))
+colnames(ST.clust) <- c("overlap", "DE")
+rownames(ST.clust) <- c("Up6", "Down6", "Up24", "Down24")
+ST.clust$prop <- ST.clust$overlap / ST.clust$DE
+
+
+FB.clust <- data.frame(cbind(
+  c(length(which(FB.6hUn.up %in% FB.clust1 | FB.6hUn.up %in% FB.clust2 | FB.6hUn.up %in% FB.clust3)),
+    length(which(FB.6hUn.down %in% FB.clust1 | FB.6hUn.down %in% FB.clust2 | FB.6hUn.down %in% FB.clust3)),
+    length(which(FB.24hUn.up %in% FB.clust1 | FB.24hUn.up %in% FB.clust2 | FB.24hUn.up %in% FB.clust3)),
+    length(which(FB.24hUn.down %in% FB.clust1 | FB.24hUn.down %in% FB.clust2 | FB.24hUn.down %in% FB.clust3))),
+  c(length(FB.6hUn.up), length(FB.6hUn.down), length(FB.24hUn.up), length(FB.24hUn.down))))
+colnames(FB.clust) <- c("overlap", "DE")
+rownames(FB.clust) <- c("Up6", "Down6", "Up24", "Down24")
+FB.clust$prop <- FB.clust$overlap / FB.clust$DE
+
+mean(c(BUR.clust[1,3], OVD.clust[1,3], SR.clust[1,3], ST.clust[1,3], PO.clust[1,3], BUR.clust[2,3], OVD.clust[2,3], SR.clust[2,3], ST.clust[1,3], PO.clust[2,3]))
+st.err(c(BUR.clust[1,3], OVD.clust[1,3], SR.clust[1,3], ST.clust[1,3], PO.clust[1,3], BUR.clust[2,3], OVD.clust[2,3], SR.clust[2,3], ST.clust[1,3], PO.clust[2,3]))
+
+mean(c(BUR.clust[1,3], OVD.clust[1,3], SR.clust[1,3], ST.clust[1,3], PO.clust[1,3]))
+st.err(c(BUR.clust[1,3], OVD.clust[1,3], SR.clust[1,3], ST.clust[1,3], PO.clust[1,3]))
+```
+
+Create a summary file of all the data
+```{r}
+FRT.summary <- tau.avgCPM
+FRT.summary <- left_join(FRT.summary, Assemb)
+FRT.summary <- left_join(FRT.summary, convert, by=c("FBgn" = "primary_FBgn"))
+FRT.summary <- left_join(FRT.summary, signal)
+FRT.summary <- left_join(FRT.summary, paml_all)
+
+FRT.summary$Enrich <- ifelse(FRT.summary$FBgn %in% WF.list.FRT, "allFRT", ifelse(FRT.summary$FBgn %in% WF.list.Epithelial, "Epithelial", ifelse(FRT.summary$FBgn %in% WF.list.Gland, "Gland", NA)))
+FRT.summary$BUR.enrich <- ifelse(FRT.summary$FBgn %in% BUR.WF.list, "BUR", NA)
+FRT.summary$OVD.enrich <- ifelse(FRT.summary$FBgn %in% OVD.WF.list, "OVD", NA)
+FRT.summary$SR.enrich <- ifelse(FRT.summary$FBgn %in% SR.WF.list, "SR", NA)
+FRT.summary$ST.enrich <- ifelse(FRT.summary$FBgn %in% ST.WF.list, "ST", NA)
+FRT.summary$PO.enrich <- ifelse(FRT.summary$FBgn %in% PO.WF.list, "PO", NA)
+FRT.summary$FB.enrich <- ifelse(FRT.summary$FBgn %in% FB.WF.list, "FB", NA)
+
+FRT.summary$FRT.all <- ifelse(FRT.summary$BUR.enrich == "BUR"& FRT.summary$OVD.enrich == "OVD"& FRT.summary$SR.enrich == "SR"& FRT.summary$ST.enrich == "ST"& FRT.summary$PO.enrich == "PO", "All.FRT", NA)
+
+FRT.summary$BUR.6 <- ifelse(FRT.summary$FBgn %in% BUR.6hUn.up, "Up", ifelse(FRT.summary$FBgn %in% BUR.6hUn.down, "Down", NA))
+FRT.summary$BUR.24 <- ifelse(FRT.summary$FBgn %in% BUR.24hUn.up, "Up", ifelse(FRT.summary$FBgn %in% BUR.24hUn.down, "Down", NA))
+FRT.summary$BUR.post <- ifelse(FRT.summary$FBgn %in% BUR.transient.up, "Transient Up", ifelse(FRT.summary$FBgn %in% BUR.transient.down, "Transient Down", ifelse( FRT.summary$FBgn %in% BUR.long.up, "Persist Up", ifelse(FRT.summary$FBgn %in% BUR.long.down, "Persist Down", NA))))
+
+FRT.summary$OVD.6 <- ifelse(FRT.summary$FBgn %in% OVD.6hUn.up, "Up", ifelse(FRT.summary$FBgn %in% OVD.6hUn.down, "Down", NA))
+FRT.summary$OVD.24 <- ifelse(FRT.summary$FBgn %in% OVD.24hUn.up, "Up", ifelse(FRT.summary$FBgn %in% OVD.24hUn.down, "Down", NA))
+FRT.summary$OVD.post <- ifelse(FRT.summary$FBgn %in% OVD.transient.up, "Transient Up", ifelse(FRT.summary$FBgn %in% OVD.transient.down, "Transient Down", ifelse( FRT.summary$FBgn %in% OVD.long.up, "Persist Up", ifelse(FRT.summary$FBgn %in% OVD.long.down, "Persist Down", NA))))
+
+FRT.summary$SR.6 <- ifelse(FRT.summary$FBgn %in% SR.6hUn.up, "Up", ifelse(FRT.summary$FBgn %in% SR.6hUn.down, "Down", NA))
+FRT.summary$SR.24 <- ifelse(FRT.summary$FBgn %in% SR.24hUn.up, "Up", ifelse(FRT.summary$FBgn %in% SR.24hUn.down, "Down", NA))
+FRT.summary$SR.post <- ifelse(FRT.summary$FBgn %in% SR.transient.up, "Transient Up", ifelse(FRT.summary$FBgn %in% SR.transient.down, "Transient Down", ifelse( FRT.summary$FBgn %in% SR.long.up, "Persist Up", ifelse(FRT.summary$FBgn %in% SR.long.down, "Persist Down", NA))))
+
+FRT.summary$ST.6 <- ifelse(FRT.summary$FBgn %in% ST.6hUn.up, "Up", ifelse(FRT.summary$FBgn %in% ST.6hUn.down, "Down", NA))
+FRT.summary$ST.24 <- ifelse(FRT.summary$FBgn %in% ST.24hUn.up, "Up", ifelse(FRT.summary$FBgn %in% ST.24hUn.down, "Down", NA))
+FRT.summary$ST.post <- ifelse(FRT.summary$FBgn %in% ST.transient.up, "Transient Up", ifelse(FRT.summary$FBgn %in% ST.transient.down, "Transient Down", ifelse( FRT.summary$FBgn %in% ST.long.up, "Persist Up", ifelse(FRT.summary$FBgn %in% ST.long.down, "Persist Down", NA))))
+
+FRT.summary$PO.6 <- ifelse(FRT.summary$FBgn %in% PO.6hUn.up, "Up", ifelse(FRT.summary$FBgn %in% PO.6hUn.down, "Down", NA))
+FRT.summary$PO.24 <- ifelse(FRT.summary$FBgn %in% PO.24hUn.up, "Up", ifelse(FRT.summary$FBgn %in% PO.24hUn.down, "Down", NA))
+FRT.summary$PO.post <- ifelse(FRT.summary$FBgn %in% PO.transient.up, "Transient Up", ifelse(FRT.summary$FBgn %in% PO.transient.down, "Transient Down", ifelse( FRT.summary$FBgn %in% PO.long.up, "Persist Up", ifelse(FRT.summary$FBgn %in% PO.long.down, "Persist Down", NA))))
+
+FRT.summary$FB.6 <- ifelse(FRT.summary$FBgn %in% FB.6hUn.up, "Up", ifelse(FRT.summary$FBgn %in% FB.6hUn.down, "Down", NA))
+FRT.summary$FB.24 <- ifelse(FRT.summary$FBgn %in% FB.24hUn.up, "Up", ifelse(FRT.summary$FBgn %in% FB.24hUn.down, "Down", NA))
+FRT.summary$FB.post <- ifelse(FRT.summary$FBgn %in% FB.transient.up, "Transient Up", ifelse(FRT.summary$FBgn %in% FB.transient.down, "Transient Down", ifelse( FRT.summary$FBgn %in% FB.long.up, "Persist Up", ifelse(FRT.summary$FBgn %in% FB.long.down, "Persist Down", NA))))
+
+
+FRT.summary <- FRT.summary[,c("FBgn", "gene_symbol", "chrom","Signal", "ML.omega", "tau", "tissuemax", "BURU", "OVDU", "SRU", "STU", "POU", "FBU", "WF", "FRT.all", "Enrich", "BUR.enrich", "OVD.enrich", "SR.enrich", "ST.enrich", "PO.enrich", "FB.enrich", "BUR.6", "BUR.24","BUR.post", "OVD.6", "OVD.24","OVD.post", "SR.6", "SR.24","SR.post", "ST.6", "ST.24","ST.post", "PO.6", "PO.24", "PO.post", "FB.6", "FB.24", "FB.post")]
+
+str(FRT.summary)
+
+FRT.summary$FRT.up6 <- rowSums(FRT.summary[,c(31,33,35,37,39)] == "Up", na.rm = T)
+FRT.summary$FRT.up24 <- rowSums(FRT.summary[,c(32,34,36,38,40)] == "Up", na.rm = T)
+FRT.summary$FRT.down6 <- rowSums(FRT.summary[,c(31,33,35,37,39)] == "Down", na.rm = T)
+FRT.summary$FRT.down24 <- rowSums(FRT.summary[,c(32,34,36,38,40)] == "Down", na.rm = T)
+
+
+
+write.table(FRT.summary, "FRT.summary.txt", col.names=T, row.names=F)
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file).
