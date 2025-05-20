@@ -1,0 +1,161 @@
+se---
+title: "R Notebook"
+output: html_notebook
+---
+
+Sample info
+```{r}
+Samples <- read.table("SampleInfo.txt", header=T)
+names <- as.data.frame(colnames(FRT))
+Samples <- merge(names, Samples, by.x="colnames(FRT)", by.y="Sample", all.x = T)
+
+write.table(Samples, "Samples.txt", col.names=T, row.names=F)
+```
+
+Gene length needed for edgeR
+```{r}
+length <- read.table("FRTlength.csv", sep=",", header=F, 
+                 row.names = NULL, 
+                 stringsAsFactors = FALSE)
+
+length <- length[,c(3,5)]
+length <- rownames.first(length)
+colnames(length) <- c("length")
+
+write.table(length, "length.txt", col.names=T, row.names=T )
+```
+
+Signal Annotation from Uniprot + Ecocarta and vesiclepedia
+```{r}
+#Downloaded fasta file of all genes with "signal" annotation from uniprot
+#With excel isolated only the header, separated out the different parts of the header and kept only the part after GN= 
+# remove any extra characters at the end
+#Convert to flybase gene nemae with fly mine
+#The whole list (6,431) after removing duplicates and anything lost in processing is 3279 genes
+
+signal <- read.table("SignalDroso.FBgn.tsv", header=F, sep="\t")
+signal <- subset(signal, signal$V4 == "Drosophila melanogaster")
+signal <- signal[grep("FBgn", signal$V3),]
+signal$Signal <- "Signal"
+signal <- signal[,c(3,5)]
+colnames(signal)<- c("FBgn", "Signal")
+
+write.table(signal, "signal.txt", col.names = T, row.names = F)
+```
+
+Evolutionary rate from PAML analysis
+```{r}
+paml_all <- read.table("paml_mel_yak_ML_update.txt", header=T, sep="\t")
+paml_all <- paml_all[,c(3,8:10)]
+colnames(paml_all) <- c("FBgn","ML.dN", "ML.dS", "ML.omega")
+
+write.table(paml_all, "paml_all.txt", col.names = T, row.names=F)
+```
+
+Covnert with gene names
+```{r}
+convert <- read.table("FBgn_annotation_ID_fb_2018_06.txt", fill=T, header=T)
+convert <- subset(convert, convert$organism_abbreviation == "Dmel")
+convert <- convert[,c(3,1)]
+
+write.table(convert, "convert.txt", col.names=T, row.names=F)
+```
+
+
+ModEncode data
+```{r}
+ME <- read.table("gene_rpkm_report_fb_2018_04.tsv", header=T, sep="\t")
+ME <- ME[,c(2,3,5,7,8,11)]
+
+#Data set is formatted annoyingly, easiest thing to do was separate all samples of interest out individually and then put them back together
+ME.F <- ME[c(grep('AdF_Ecl_5days', ME$RNASource_name)),]
+ME.F <- ME.F[,c(1,5)]
+colnames(ME.F) <- c("FBgn", "F")
+
+ME.M <- ME[c(grep('AdM_Ecl_5days', ME$RNASource_name)),]
+ME.M <- ME.M[,c(1,5)]
+colnames(ME.M) <- c("FBgn", "M")
+
+#Create data table of just log2FC between whole female and whole male
+ME.FM <- full_join(ME.F, ME.M, by="FBgn")
+ME.FM[is.na(ME.FM)] <- 0
+ME.FM$FM <- signif(log(ME.FM$F +1, 2) - log(ME.FM$M +1, 2),3)
+ME.FM <- ME.FM[,c(1,4)]
+
+write.table(ME.FM, "sexbias.ME.txt", col.names = T, row.names = F)
+
+#Do the same for all the tissues
+ME.testis <-ME[c(grep('testis', ME$RNASource_name)),]
+ME.testis <- ME.testis[,c(1,5)]
+colnames(ME.testis) <- c("FBgn", "Testis")
+
+ME.ag <- ME[c(grep('acc_gland', ME$RNASource_name)),]
+ME.ag <- ME.ag[,c(1,5)]
+colnames(ME.ag) <- c("FBgn", "AG")
+
+ME.ovaryV <- ME[c(grep('VirF_4d_ovary', ME$RNASource_name)),]
+ME.ovaryV <- ME.ovaryV[,c(1,5)]
+colnames(ME.ovaryV) <- c("FBgn", "Ovary.V")
+
+ME.ovaryM <- ME[c(grep('MateF_4d_ovary', ME$RNASource_name)),]
+ME.ovaryM <- ME.ovaryM[,c(1,5)]
+colnames(ME.ovaryM) <- c("FBgn", "Ovary.M")
+
+ME.headFV <- ME[c(grep('mE_mRNA_A_VirF_4d_head', ME$RNASource_name)),]
+ME.headFV <- ME.headFV[,c(1,5)]
+colnames(ME.headFV) <- c("FBgn", "Head.F.V")
+
+ME.headFM <- ME[c(grep('mE_mRNA_A_MateF_4d_head', ME$RNASource_name)),]
+ME.headFM <- ME.headFM[,c(1,5)]
+colnames(ME.headFM) <- c("FBgn", "Head.F.M")
+
+ME.headMM <- ME[c(grep('mE_mRNA_A_MateM_4d_head', ME$RNASource_name)),]
+ME.headMM <- ME.headMM[,c(1,5)]
+colnames(ME.headMM) <- c("FBgn", "Head.M")
+
+ME.gut <- ME[c(grep('4d_dig_sys', ME$RNASource_name)),]
+ME.gut <- ME.gut[,c(1,5)]
+colnames(ME.gut) <- c("FBgn", "Gut")
+
+ME.carcass <- ME[c(grep('mE_mRNA_A_4d_carcass', ME$RNASource_name)),]
+ME.carcass <- ME.carcass[,c(1,5)]
+colnames(ME.carcass) <- c("FBgn", "Carcass")
+
+#create data table of ME tissue data
+ME.tissue <- full_join(ME.testis, ME.ag)
+ME.tissue <- full_join(ME.tissue, ME.ovaryV)
+ME.tissue <- full_join(ME.tissue, ME.ovaryM)
+ME.tissue <- full_join(ME.tissue, ME.gut)
+ME.tissue <- full_join(ME.tissue, ME.headFV)
+ME.tissue <- full_join(ME.tissue, ME.headFM)
+ME.tissue <- full_join(ME.tissue, ME.headMM)
+ME.tissue <- full_join(ME.tissue, ME.carcass)
+
+# Calculate averages and put together tissue data set
+ME.tissue$OvaryAvg <- rowMeans(ME.tissue[,c(4,5)])
+ME.tissue$HeadAvg <- rowMeans(ME.tissue[,c(7:8)])
+ME.tissue$HeadAvg <- rowMeans(ME.tissue[,c(9,12)])
+ME.tissue <- ME.tissue[,c(1,2,3,6,10,11,12)]
+ME.tissue[is.na(ME.tissue)] <- 0
+
+#Finalize whole ME dataset with log2RPKM
+ME.tissue[,c(2:7)] <- log(ME.tissue[,c(2:7)] + 1, 2)
+
+#determine which tissue has max expression
+ME.tissuemax <- ME.tissue
+ME.tissuemax$maxME <- apply(ME.tissuemax[,c(2:7)],1, which.max)
+ME.tissuemax$tissuemaxME <- with(ME.tissuemax,
+ifelse(ME.tissuemax$maxME ==1 & ME.tissuemax$Testis > 0, "Testis",
+ifelse(ME.tissuemax$maxME ==2, "AG",
+ifelse(ME.tissuemax$maxME ==3, "Gut",
+ifelse(ME.tissuemax$maxME ==4, "Carcass",
+ifelse(ME.tissuemax$maxME ==5, "Ovary",
+ifelse(ME.tissuemax$maxME ==6, "Head", "NoData")))))))
+
+write.table(ME.tissuemax, "ME.tissue.txt", col.names = T, row.names = F)
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file).
